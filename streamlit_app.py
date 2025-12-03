@@ -222,12 +222,12 @@ def display_admin_inventory():
 def get_user_cart(user_id, cart_version):
     """Retrieves the user's current cart items, cached by user_id and cart_version."""
     conn = get_db_connection()
-    query = f"""
+    query = """
     SELECT T1.id AS cart_item_id, T2.id AS product_id, T2.name, T2.price, T1.quantity, T2.size, T2.image_url
     FROM CART AS T1 JOIN PRODUCTS AS T2 ON T1.product_id = T2.id
-    WHERE T1.user_id = '{{user_id}}'
+    WHERE T1.user_id = ?
     """
-    df = pd.read_sql_query(query, conn)
+    df = pd.read_sql_query(query, conn, params=(user_id,))
     return df
 
 def add_to_cart(product_id, quantity):
