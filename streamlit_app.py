@@ -574,7 +574,7 @@ def customer_faq_enquiries():
         """)
     st.subheader("Contact Us")
     st.info("Email support@tshirts.com for enquiries.")
-    # --- MAIN APP LAYOUT ---
+# --- MAIN APP LAYOUT ---
 
 def main_app():
     """The main entry point for the Streamlit application."""
