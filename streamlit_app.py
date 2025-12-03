@@ -34,8 +34,13 @@ st.session_state.setdefault('cart_version', 0)
 
 @st.cache_resource
 def get_db_connection():
-    """Establishes and returns a single, cached connection to the SQLite database."""
-    conn = sqlite3.connect('inventory.db')
+    """
+    Establishes and returns a single, cached connection to the SQLite database.
+    
+    IMPORTANT: check_same_thread=False is added to prevent Streamlit's threading 
+    from causing SQLite ProgrammingErrors when accessing the connection across threads.
+    """
+    conn = sqlite3.connect('inventory.db', check_same_thread=False)
     # Use row_factory to access columns by name (optional but nice)
     conn.row_factory = sqlite3.Row 
     return conn
@@ -82,8 +87,7 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES USERS(username)
         );
     ''')
-
-    # Add initial users
+      # Add initial users
     try:
         c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('adminpass'), 'admin'))
         c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('custpass'), 'customer'))
@@ -212,9 +216,7 @@ def display_admin_inventory():
     
     if df.empty: st.info("The inventory is currently empty.")
     else: st.dataframe(df, column_config={"price": st.column_config.NumberColumn("Price ($)", format="$%.2f")}, hide_index=True)
-
-
-# --- CUSTOMER FEATURES ---
+    # --- CUSTOMER FEATURES ---
 
 @st.cache_data(show_spinner="Loading cart...")
 def get_user_cart(user_id, cart_version):
@@ -372,7 +374,6 @@ def customer_checkout(cart_df):
                     st.session_state.order_total = total # Save the final total
                     st.session_state.shipping_address = address
                     st.rerun()
-
     # --- STAGE 2: DELIVERY SIMULATION & CONFIRMATION ---
     if st.session_state.get('checkout_substage') == 'delivered':
         
@@ -618,8 +619,7 @@ def main_app():
             st.caption("Admin: `admin` / `adminpass`")
             st.caption("Customer: `customer1` / `custpass`")
 
-
-    # Main Content Area
+ Main Content Area
     if not st.session_state.logged_in:
         st.title("T-Shirt Inventory Portal")
         st.info("Please log in to proceed.")
