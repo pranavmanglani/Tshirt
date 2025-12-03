@@ -19,6 +19,9 @@ if 'username' not in st.session_state:
     st.session_state.username = None
 if 'role' not in st.session_state:
     st.session_state.role = None
+# New state for managing customer flow: 'catalog', 'payment'
+if 'checkout_stage' not in st.session_state:
+    st.session_state.checkout_stage = 'catalog'
 
 def get_db_connection():
     """Establishes and returns a connection to the SQLite database."""
@@ -67,6 +70,19 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES USERS(username),
             FOREIGN KEY(product_id) REFERENCES PRODUCTS(id),
             UNIQUE(user_id, product_id)
+        )
+    ''')
+    
+    # 4. ORDERS Table (for logging successful transactions)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS ORDERS (
+            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            total_amount REAL NOT NULL,
+            tracking_id TEXT NOT NULL,
+            order_date TEXT NOT NULL,
+            shipping_address TEXT,
+            FOREIGN KEY(user_id) REFERENCES USERS(username)
         )
     ''')
 
@@ -155,6 +171,7 @@ def auth_forms():
                     st.session_state.logged_in = True
                     st.session_state.username = username
                     st.session_state.role = role
+                    st.session_state.checkout_stage = 'catalog' # Reset stage on successful login
                     st.success(f"Welcome, {username}! Logged in as {role.capitalize()}.")
                     st.rerun()
                 else:
@@ -192,6 +209,7 @@ def logout():
     st.session_state.logged_in = False
     st.session_state.username = None
     st.session_state.role = None
+    st.session_state.checkout_stage = 'catalog'
     st.info("You have been logged out.")
     st.rerun()
 
@@ -325,6 +343,7 @@ def get_user_cart():
         T2.name, 
         T2.price, 
         T1.quantity,
+        T2.size,
         T2.image_url
     FROM CART AS T1
     JOIN PRODUCTS AS T2 ON T1.product_id = T2.id
@@ -343,21 +362,110 @@ def clear_user_cart(user_id):
     conn.close()
 
 def customer_checkout(cart_df):
-    """Simulates the 'Buy' process."""
+    """Handles the multi-stage fake payment and delivery process."""
+    user_id = st.session_state.username
+    
+    # Check for empty cart
     if cart_df.empty:
         st.error("Your cart is empty. Please add items to buy.")
+        st.session_state.checkout_stage = 'catalog'
         return
-    
-    total = (cart_df['price'] * cart_df['quantity']).sum()
-    
-    st.subheader("Confirm Purchase")
-    st.write(f"Total payable amount: **${total:.2f}**")
-    
-    if st.button("Complete Purchase", type="primary"):
-        clear_user_cart(st.session_state.username)
-        st.balloons()
-        st.success("🎉 Purchase successful! Your order is being processed. Thank you for shopping with us.")
-        st.rerun() # Refresh the view to show an empty cart
+
+    # ------------------ STAGE 1: PAYMENT FORM ------------------
+    if st.session_state.get('checkout_substage') != 'delivered':
+        
+        st.subheader("1. Order Summary")
+        total = (cart_df['price'] * cart_df['quantity']).sum()
+        
+        # Display cart contents in a neat table
+        st.dataframe(
+            cart_df[['name', 'size', 'quantity', 'price']],
+            column_config={
+                "name": "Product",
+                "size": "Size",
+                "price": st.column_config.NumberColumn("Price ($)", format="$%.2f"),
+                "quantity": "Qty",
+            },
+            hide_index=True,
+        )
+        st.metric("Total Payable", f"${total:.2f}")
+        st.markdown("---")
+
+
+        st.subheader("2. 💳 Fake Payment Gateway")
+        with st.form("payment_form", clear_on_submit=False):
+            st.warning("⚠️ This is a simulated payment gateway. The transaction will be faked for demonstration.")
+            
+            # Fake fields
+            card_number = st.text_input("Card Number", max_chars=16, value="4111 1111 1111 1111")
+            col1, col2 = st.columns(2)
+            with col1:
+                expiry = st.text_input("Expiry Date (MM/YY)", max_chars=5, value="12/26")
+            with col2:
+                cvv = st.text_input("CVV", type="password", max_chars=3, value="123")
+                
+            address = st.text_area("Shipping Address", "123 Main St, Springfield, Anystate, 12345")
+            
+            submitted = st.form_submit_button("Process Payment & Place Order", type="primary")
+
+            if submitted:
+                # Simple validation for non-empty fields
+                if len(card_number.replace(' ', '')) != 16 or len(cvv) != 3 or not address:
+                    st.error("Please enter valid fake payment details and a shipping address.")
+                    return
+                
+                # Payment Simulation Success
+                st.session_state.checkout_substage = 'delivered'
+                st.session_state.order_total = total
+                st.session_state.shipping_address = address
+                st.rerun() # Rerun to move to the next stage
+
+    # ------------------ STAGE 2: DELIVERY SIMULATION & CONFIRMATION ------------------
+    if st.session_state.get('checkout_substage') == 'delivered':
+        
+        # Log Order details
+        tracking_id = f"DEL-{hash_password(user_id)[:6].upper()}-{pd.Timestamp.now().strftime('%d%H%M')}"
+        
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        try:
+            # Save the fake order
+            c.execute("INSERT INTO ORDERS (user_id, total_amount, tracking_id, order_date, shipping_address) VALUES (?, ?, ?, ?, ?)",
+                      (user_id, st.session_state.order_total, tracking_id, str(pd.Timestamp.now()), st.session_state.shipping_address))
+            conn.commit()
+            
+            # Clear the cart (simulating order completion)
+            clear_user_cart(user_id)
+            
+            st.balloons()
+            st.success("🎉 Purchase Successful! Your payment was processed.")
+
+            st.markdown("---")
+            st.subheader("3. 🚚 Fake Delivery System Confirmation")
+            st.info("Your order has been transferred to our shipping department and is now **Processing**.")
+            
+            # Display simulated delivery details
+            st.markdown(f"**Tracking ID:** `{tracking_id}`")
+            st.markdown(f"**Shipping Address:** {st.session_state.shipping_address}")
+            estimated_delivery = pd.Timestamp.now() + pd.Timedelta(days=7)
+            st.markdown(f"**Estimated Delivery:** **{estimated_delivery.strftime('%A, %B %d, %Y')}**")
+            
+            st.markdown("---")
+            if st.button("Back to Shopping", type="secondary"):
+                # Reset all checkout states and go back to catalog
+                st.session_state.checkout_stage = 'catalog'
+                st.session_state.checkout_substage = None
+                st.session_state.order_total = None
+                st.session_state.shipping_address = None
+                st.rerun()
+                
+        except Exception as e:
+            st.error(f"Error saving order: {e}")
+        finally:
+            conn.close()
+            # Reset sub-stage in case of an error to prevent looping
+            st.session_state.checkout_substage = None
 
 def customer_faq_enquiries():
     """Section for FAQs and enquiries."""
@@ -405,64 +513,11 @@ def main_app():
                 if cart_df.empty:
                     st.markdown("Your cart is empty.")
                 else:
-                    # Display cart items and calculate total
-                    for index, row in cart_df.iterrows():
-                        st.markdown(f"**{row['name']}**")
-                        st.markdown(f"Quantity: {row['quantity']} | \${row['price']:.2f} each")
-                        st.markdown("---")
-                    
+                    # Calculate total without displaying all items
                     total = (cart_df['price'] * cart_df['quantity']).sum()
+                    st.markdown(f"Items in cart: **{cart_df['quantity'].sum()}**")
                     st.metric("Cart Total", f"${total:.2f}")
 
                     # Buy Button
                     if st.button("Proceed to Buy", key="buy_btn", type="primary"):
-                        st.session_state.checkout_mode = True
-                        st.rerun()
-
-        else:
-            # Display combined Login/Sign Up forms when not logged in
-            auth_forms()
-            st.markdown("---")
-            st.caption("Admin User: `admin` / `adminpass`")
-            st.caption("Customer User: `customer1` / `custpass`")
-
-
-    # Main Content Area
-    if not st.session_state.logged_in:
-        st.title("Welcome to the T-Shirt Inventory Portal")
-        st.info("Please log in or sign up on the sidebar to access the Customer Shop or Admin Dashboard.")
-
-    elif st.session_state.role == 'admin':
-        st.title("👨‍💻 Admin Dashboard")
-        
-        # Tabs for Admin functionality
-        tab1, tab2 = st.tabs(["Add Product", "View Inventory (Pandas)"])
-        
-        with tab1:
-            admin_add_product()
-
-        with tab2:
-            admin_view_inventory()
-
-    elif st.session_state.role == 'customer':
-        if st.session_state.get('checkout_mode', False):
-            st.title("Checkout")
-            cart_df = get_user_cart()
-            customer_checkout(cart_df)
-            st.session_state.checkout_mode = False # Reset mode after purchase attempt or confirmation
-
-        else:
-            st.title("Welcome to the Customer Shop")
-
-            # Tabs for Customer functionality
-            tab1, tab2 = st.tabs(["T-Shirt Catalog", "FAQ / Enquiries"])
-            
-            with tab1:
-                customer_browse_products()
-
-            with tab2:
-                customer_faq_enquiries()
-
-
-if __name__ == '__main__':
-    main_app()
+                        st.session_state.
