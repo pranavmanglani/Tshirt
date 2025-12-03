@@ -34,11 +34,11 @@ def get_db_connection():
     """
     Establishes and returns a single, cached connection to the SQLite database.
     
-    FIX: Added a 5-second timeout and disabled same-thread check to handle 
-    Streamlit's multi-threading/re-running, resolving 'Database is locked' errors.
+    CRITICAL FIX: Added a 5-second timeout and disabled same-thread check to handle 
+    Streamlit's multi-threading/re-running, resolving 'Database is locked' 
+    and 'ProgrammingError: SQLite objects created in a thread...' errors.
     """
-    # CRITICAL FIX: Add timeout=5 to wait for the lock to release, and 
-    # check_same_thread=False to prevent Streamlit threading errors.
+    # This line contains the necessary fix for Streamlit database concurrency issues.
     conn = sqlite3.connect('inventory.db', check_same_thread=False, timeout=5)
     conn.row_factory = sqlite3.Row 
     return conn
@@ -85,6 +85,7 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES USERS(username)
         );
     ''')
+
     # Add initial users
     try:
         c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('adminpass'), 'admin'))
@@ -176,8 +177,7 @@ def auth_forms():
                     result = sign_up_user(new_username, new_password)
                     if result == "Success": st.success("Account created successfully! Please log in.")
                     else: st.error(result)
-                        
-    # --- ADMIN FEATURES (CRUD) ---
+# --- ADMIN FEATURES (CRUD) ---
 
 def admin_add_product():
     """Form to add a new product."""
@@ -343,7 +343,8 @@ def customer_checkout(cart_df):
                 )
 
         st.markdown("---")
-         # --- Discount/Coupon Wheel ---
+        
+        # --- Discount/Coupon Wheel ---
         st.subheader("🎁 Spin to Win a Discount!")
         
         if st.session_state.coupon_code is None:
@@ -563,9 +564,8 @@ def user_profile_view():
                 "order_date": "Date Placed",
             },
             hide_index=True
-        )
-
-def customer_faq_enquiries():
+                    )
+                    def customer_faq_enquiries():
     """Section for FAQs and enquiries."""
     st.markdown("### ❓ Customer Enquiries & FAQ")
     st.markdown("""
@@ -576,6 +576,7 @@ def customer_faq_enquiries():
         """)
     st.subheader("Contact Us")
     st.info("Email support@tshirts.com for enquiries.")
+
 # --- MAIN APP LAYOUT ---
 
 def main_app():
@@ -613,7 +614,6 @@ def main_app():
                     st.markdown("Your cart is empty.")
                 else:
                     total = (cart_df['price'] * cart_df['quantity']).sum()
-                    st.markdown(f"Items: **{cart_df['quantity'].sum()}**")
                     st.metric("Total", f"${total:.2f}")
 
                     if st.button("Proceed to Checkout", key="buy_btn", type="primary"):
