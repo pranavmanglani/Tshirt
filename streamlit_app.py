@@ -462,7 +462,7 @@ def customer_browse_products():
             if col.button("View Details", key=f"view_detail_{row['id']}"):
                 st.session_state.selected_product_id = row['id']
                 st.session_state.current_view = 'detail'
-                  st.rerun()
+                st.rerun()
 
 def product_detail_view():
     """Displays single product details and allows adding to cart."""
