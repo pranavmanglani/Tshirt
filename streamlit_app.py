@@ -34,10 +34,12 @@ def get_db_connection():
     """
     Establishes and returns a single, cached connection to the SQLite database.
     
-    CRITICAL FIX: check_same_thread=False prevents Streamlit's threading from 
-    causing SQLite ProgrammingErrors.
+    FIX: Added a 5-second timeout and disabled same-thread check to handle 
+    Streamlit's multi-threading/re-running, resolving 'Database is locked' errors.
     """
-    conn = sqlite3.connect('inventory.db', check_same_thread=False)
+    # CRITICAL FIX: Add timeout=5 to wait for the lock to release, and 
+    # check_same_thread=False to prevent Streamlit threading errors.
+    conn = sqlite3.connect('inventory.db', check_same_thread=False, timeout=5)
     conn.row_factory = sqlite3.Row 
     return conn
 
