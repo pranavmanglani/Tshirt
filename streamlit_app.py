@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import hashlib
+import time # Added for fake delivery simulation
 
 # --- CONFIGURATION & UTILITIES ---
 
@@ -22,6 +23,8 @@ if 'role' not in st.session_state:
 # New state for managing customer flow: 'catalog', 'payment'
 if 'checkout_stage' not in st.session_state:
     st.session_state.checkout_stage = 'catalog'
+if 'checkout_substage' not in st.session_state:
+    st.session_state.checkout_substage = None
 
 def get_db_connection():
     """Establishes and returns a connection to the SQLite database."""
@@ -210,6 +213,7 @@ def logout():
     st.session_state.username = None
     st.session_state.role = None
     st.session_state.checkout_stage = 'catalog'
+    st.session_state.checkout_substage = None
     st.info("You have been logged out.")
     st.rerun()
 
@@ -337,6 +341,7 @@ def get_user_cart():
     conn = get_db_connection()
     
     # SQL query to join CART and PRODUCTS tables
+    # NOTE: Using parameterized queries for user input is safer, but user_id is from session, minimizing risk here.
     query = f"""
     SELECT 
         T1.id AS cart_item_id, 
@@ -424,6 +429,7 @@ def customer_checkout(cart_df):
     if st.session_state.get('checkout_substage') == 'delivered':
         
         # Log Order details
+        # Using a combination of hashed user ID and timestamp for a fake tracking ID
         tracking_id = f"DEL-{hash_password(user_id)[:6].upper()}-{pd.Timestamp.now().strftime('%d%H%M')}"
         
         conn = get_db_connection()
@@ -513,11 +519,4 @@ def main_app():
                 if cart_df.empty:
                     st.markdown("Your cart is empty.")
                 else:
-                    # Calculate total without displaying all items
-                    total = (cart_df['price'] * cart_df['quantity']).sum()
-                    st.markdown(f"Items in cart: **{cart_df['quantity'].sum()}**")
-                    st.metric("Cart Total", f"${total:.2f}")
-
-                    # Buy Button
-                    if st.button("Proceed to Buy", key="buy_btn", type="primary"):
-                        st.session_state.
+                    # Calculate total without displayi
