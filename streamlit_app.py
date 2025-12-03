@@ -114,29 +114,78 @@ def authenticate(username, password):
         return user[0]
     return None
 
-def login_form():
-    """Displays the login form."""
-    st.subheader("Inventory System Login")
+def sign_up_user(username, password):
+    """Adds a new customer user to the database."""
+    conn = get_db_connection()
+    c = conn.cursor()
+    hashed_password = hash_password(password)
 
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login")
+    try:
+        # Check if username already exists
+        c.execute("SELECT username FROM USERS WHERE username = ?", (username,))
+        if c.fetchone():
+            return "Username already exists. Please choose a different one."
 
-        if submitted:
-            role = authenticate(username, password)
-            if role:
-                st.session_state.logged_in = True
-                st.session_state.username = username
-                st.session_state.role = role
-                st.success(f"Welcome, {username}! Logged in as {role.capitalize()}.")
-                # Rerun to switch to the appropriate dashboard
-                st.rerun()
-            else:
-                st.error("Invalid username or password.")
-                st.session_state.logged_in = False
-                st.session_state.username = None
-                st.session_state.role = None
+        # Insert new user as 'customer'
+        c.execute("INSERT INTO USERS (username, password, role) VALUES (?, ?, ?)",
+                  (username, hashed_password, 'customer'))
+        conn.commit()
+        return "Success"
+    except Exception as e:
+        return f"Database error during sign up: {e}"
+    finally:
+        conn.close()
+
+def auth_forms():
+    """Displays the login and sign up forms using tabs."""
+    
+    tab_login, tab_signup = st.tabs(["Login", "Sign Up"])
+
+    # --- LOGIN TAB ---
+    with tab_login:
+        st.subheader("Existing User Login")
+        with st.form("login_form_tab", clear_on_submit=False): 
+            username = st.text_input("Username (Login)")
+            password = st.text_input("Password (Login)", type="password")
+            submitted = st.form_submit_button("Login")
+
+            if submitted:
+                role = authenticate(username, password)
+                if role:
+                    st.session_state.logged_in = True
+                    st.session_state.username = username
+                    st.session_state.role = role
+                    st.success(f"Welcome, {username}! Logged in as {role.capitalize()}.")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+                    st.session_state.logged_in = False
+                    st.session_state.username = None
+                    st.session_state.role = None
+    
+    # --- SIGN UP TAB ---
+    with tab_signup:
+        st.subheader("New Customer Sign Up")
+        with st.form("signup_form", clear_on_submit=True):
+            new_username = st.text_input("Choose Username (Sign Up)")
+            new_password = st.text_input("Choose Password (Sign Up)", type="password")
+            confirm_password = st.text_input("Confirm Password", type="password")
+            
+            submitted_signup = st.form_submit_button("Create Account")
+
+            if submitted_signup:
+                if not new_username or not new_password or not confirm_password:
+                     st.error("All fields are required.")
+                elif new_password != confirm_password:
+                    st.error("Passwords do not match.")
+                elif len(new_username) < 4 or len(new_password) < 6:
+                    st.error("Username must be at least 4 characters and password at least 6 characters.")
+                else:
+                    result = sign_up_user(new_username, new_password)
+                    if result == "Success":
+                        st.success("Account created successfully! Please switch to the Login tab to sign in.")
+                    else:
+                        st.error(result)
 
 def logout():
     """Logs out the user and clears session state."""
@@ -371,7 +420,8 @@ def main_app():
                         st.rerun()
 
         else:
-            login_form()
+            # Display combined Login/Sign Up forms when not logged in
+            auth_forms()
             st.markdown("---")
             st.caption("Admin User: `admin` / `adminpass`")
             st.caption("Customer User: `customer1` / `custpass`")
@@ -380,7 +430,7 @@ def main_app():
     # Main Content Area
     if not st.session_state.logged_in:
         st.title("Welcome to the T-Shirt Inventory Portal")
-        st.info("Please log in on the sidebar to access the Customer Shop or Admin Dashboard.")
+        st.info("Please log in or sign up on the sidebar to access the Customer Shop or Admin Dashboard.")
 
     elif st.session_state.role == 'admin':
         st.title("👨‍💻 Admin Dashboard")
