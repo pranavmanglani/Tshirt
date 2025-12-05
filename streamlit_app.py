@@ -20,8 +20,8 @@ def hash_password(password):
 # --- STANDALONE DATABASE INITIALIZATION FUNCTION ---
 def initialize_database(target_db_path):
     """
-    Creates the database file and initializes all schema tables and initial data.
-    New fields: profile_pic_url, birthday (USERS), category, cost, image_url (PRODUCTS).
+    Creates the database file and initializes all schema tables and initial data,
+    including sample sales data for analytics.
     """
     conn = None
     try:
@@ -98,9 +98,13 @@ def initialize_database(target_db_path):
 
             # Add initial products (Multiple products for filtering)
             products_data = [
-                ('Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 'T-Shirt', 25.00, 10.00, 100, 'https://placehold.co/400x400/36454F/FFFFFF?text=Code+Tee'),
-                ('Python Logo Hoodie', 'Warm hoodie featuring the Python logo.', 'Hoodie', 55.00, 25.00, 50, 'https://placehold.co/400x400/FFD700/000000?text=Python+Hoodie'),
-                ('JavaScript Mug', 'A large coffee mug for late-night coding sessions.', 'Accessory', 15.00, 5.00, 200, 'https://placehold.co/400x400/76FF03/000000?text=JS+Mug'),
+                # ID 1: Vintage Coding Tee (Price: 25.00, Cost: 10.00, Profit: 15.00)
+                ('Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 'T-Shirt', 25.00, 10.00, 95, 'https://placehold.co/400x400/36454F/FFFFFF?text=Code+Tee'),
+                # ID 2: Python Logo Hoodie (Price: 55.00, Cost: 25.00, Profit: 30.00)
+                ('Python Logo Hoodie', 'Warm hoodie featuring the Python logo.', 'Hoodie', 55.00, 25.00, 48, 'https://placehold.co/400x400/FFD700/000000?text=Python+Hoodie'),
+                # ID 3: JavaScript Mug (Price: 15.00, Cost: 5.00, Profit: 10.00)
+                ('JavaScript Mug', 'A large coffee mug for late-night coding sessions.', 'Accessory', 15.00, 5.00, 198, 'https://placehold.co/400x400/76FF03/000000?text=JS+Mug'),
+                # ID 4: SQL Query Cap (Price: 20.00, Cost: 7.50, Profit: 12.50)
                 ('SQL Query Cap', 'A stylish baseball cap with a subtle SQL joke.', 'Cap', 20.00, 7.50, 75, 'https://placehold.co/400x400/E53935/FFFFFF?text=SQL+Cap'),
             ]
             c.executemany("INSERT INTO PRODUCTS (name, description, category, price, cost, stock, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)", products_data)
@@ -108,6 +112,36 @@ def initialize_database(target_db_path):
             # Add initial discount codes
             c.execute("INSERT INTO DISCOUNTS VALUES (?, ?, ?, ?)", ('SAVE10', 'percent', 10.0, 1)) # 10% off
             c.execute("INSERT INTO DISCOUNTS VALUES (?, ?, ?, ?)", ('FIVER', 'fixed', 5.0, 1)) # $5 off
+            
+            # --- Sample Order Data for Analytics (Q1 2024) ---
+            
+            # Note: total_amount = total_cost + total_profit
+            sample_orders = [
+                # Order 1 (Jan 1, 2024): 1x Tee ($25.00)
+                ('ORD-20240101-001', 'customer1@email.com', '2024-01-01T10:00:00', 25.00, 10.00, 15.00, 'Shipped', 'John Doe', '123 Main St', 'CityA', '10001'),
+                # Order 2 (Jan 5, 2024): 1x Hoodie ($55.00)
+                ('ORD-20240105-002', 'admin@shop.com', '2024-01-05T12:00:00', 55.00, 25.00, 30.00, 'Processing', 'Admin User', '456 Side Ave', 'CityB', '20002'),
+                # Order 3 (Feb 15, 2024): 2x Mug ($30.00) - Total profit 20.00
+                ('ORD-20240215-003', 'customer1@email.com', '2024-02-15T14:30:00', 30.00, 10.00, 20.00, 'Delivered', 'John Doe', '123 Main St', 'CityA', '10001'),
+                # Order 4 (Mar 10, 2024): 1x Tee, 1x Hoodie ($25 + $55 = $80.00) - Profit: 15+30=45
+                ('ORD-20240310-004', 'customer1@email.com', '2024-03-10T11:00:00', 80.00, 35.00, 45.00, 'Shipped', 'John Doe', '123 Main St', 'CityA', '10001'),
+            ]
+            c.executemany("INSERT INTO ORDERS VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", sample_orders)
+
+            sample_items = [
+                # Items for ORD-20240101-001 (Product ID 1: Tee)
+                ('ORD-20240101-001', 1, 'M', 1, 25.00, 10.00), 
+                # Items for ORD-20240105-002 (Product ID 2: Hoodie)
+                ('ORD-20240105-002', 2, 'L', 1, 55.00, 25.00), 
+                # Items for ORD-20240215-003 (Product ID 3: Mug)
+                ('ORD-20240215-003', 3, 'N/A', 2, 15.00, 5.00), 
+                # Items for ORD-20240310-004 (Product ID 1: Tee)
+                ('ORD-20240310-004', 1, 'S', 1, 25.00, 10.00),
+                # Items for ORD-20240310-004 (Product ID 2: Hoodie)
+                ('ORD-20240310-004', 2, 'XL', 1, 55.00, 25.00), 
+            ]
+            # Note: item_id is AUTOINCREMENT, so we only list 6 parameters here
+            c.executemany("INSERT INTO ORDER_ITEMS (order_id, product_id, size, quantity, unit_price, unit_cost) VALUES (?, ?, ?, ?, ?, ?)", sample_items)
             
 
     except Exception as e:
@@ -285,6 +319,8 @@ def place_order(email, cart_items, final_amount, full_name, address, city, zip_c
             c = conn.cursor()
             
             with conn: 
+                order_item_details = []
+                
                 for item in cart_items:
                     c.execute("SELECT stock, cost FROM PRODUCTS WHERE product_id = ?", (item['product_id'],))
                     product_data = c.fetchone()
@@ -297,11 +333,10 @@ def place_order(email, cart_items, final_amount, full_name, address, city, zip_c
                             # Accumulate cost for the order
                             total_cost += unit_cost * item['quantity']
                             
-                            # Insert order item
-                            c.execute("INSERT INTO ORDER_ITEMS (order_id, product_id, size, quantity, unit_price, unit_cost) VALUES (?, ?, ?, ?, ?, ?)",
-                                    (order_id, item['product_id'], item['size'], item['quantity'], item['price'], unit_cost))
+                            # Prepare item for insertion
+                            order_item_details.append((order_id, item['product_id'], item['size'], item['quantity'], item['price'], unit_cost))
 
-                            # Update stock
+                            # Update stock (perform updates after ensuring all items are valid)
                             new_stock = current_stock - item['quantity']
                             c.execute("UPDATE PRODUCTS SET stock = ? WHERE product_id = ?", (new_stock, item['product_id']))
                         else:
@@ -311,6 +346,9 @@ def place_order(email, cart_items, final_amount, full_name, address, city, zip_c
                 
                 total_profit = final_amount - total_cost
                 
+                # Insert all order items
+                c.executemany("INSERT INTO ORDER_ITEMS (order_id, product_id, size, quantity, unit_price, unit_cost) VALUES (?, ?, ?, ?, ?, ?)", order_item_details)
+
                 # Insert order record
                 c.execute("INSERT INTO ORDERS (order_id, email, order_date, total_amount, total_cost, total_profit, status, full_name, address, city, zip_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (order_id, email, order_date, final_amount, total_cost, total_profit, 'Processing', full_name, address, city, zip_code))
@@ -736,13 +774,14 @@ def admin_product_management():
             with col_cost:
                 new_cost = st.number_input("Manufacture Cost ($)", min_value=0.01, format="%.2f")
             with col_stock:
-                new_stock = st.number_input("Initial Stock", min_value=0, step=1)
+                # User request: Keeping bulk quantity in stock
+                new_stock = st.number_input("Initial Stock (Bulk Quantity)", min_value=0, step=1)
                 
             if st.form_submit_button("Add Product", type="primary"):
                 if new_name and new_desc and new_price > 0 and new_cost > 0 and new_stock >= 0 and new_image_url:
                     if add_product(new_name, new_desc, new_category, new_price, new_cost, new_stock, new_image_url):
                         st.success(f"Product '{new_name}' added successfully! Note: Image is stored as URL, not a file.")
-                        # Form clears automatically due to clear_on_submit=True
+                        # Form clears automatically due to clear_on_submit=True (User request #3)
                         st.rerun()
                     else:
                         st.error("Failed to add product.")
@@ -756,10 +795,10 @@ def admin_product_management():
     df_products = db_manager.fetch_query_df("SELECT product_id, image_url, name, category, price, cost, stock FROM PRODUCTS")
     
     if not df_products.empty:
-        # Prepare DataFrame for better display (showing image instead of link)
+        # Prepare DataFrame for better display (showing image instead of link - User request #4)
         df_display = df_products.copy()
         
-        # Display image using markdown/HTML for better visibility
+        # Function to display image instead of URL
         def format_image(url):
              return f'<img src="{url}" style="width: 100px; height: 100px; object-fit: cover; border-radius: 4px;"/>'
              
@@ -771,27 +810,32 @@ def admin_product_management():
         # Delete Product Selection
         st.markdown("##### Delete Existing Product")
         product_options = {f"{row['Name']} (ID: {row['ID']})": row['ID'] for index, row in df_display.iterrows()}
-        selected_product_name = st.selectbox("Select Product to Delete", list(product_options.keys()))
         
-        if selected_product_name:
-            product_to_delete_id = product_options[selected_product_name]
+        # Check if there are any products to select
+        if product_options:
+            selected_product_name = st.selectbox("Select Product to Delete", list(product_options.keys()))
             
-            if st.button(f"Delete '{selected_product_name}'", type="secondary"):
-                if delete_product(product_to_delete_id):
-                    st.success(f"Product ID {product_to_delete_id} deleted.")
-                    st.rerun()
-                else:
-                    st.error("Could not delete product.")
+            if selected_product_name:
+                product_to_delete_id = product_options[selected_product_name]
+                
+                if st.button(f"Delete '{selected_product_name}'", type="secondary"):
+                    if delete_product(product_to_delete_id):
+                        st.success(f"Product ID {product_to_delete_id} deleted.")
+                        st.rerun()
+                    else:
+                        st.error("Could not delete product.")
+        else:
+            st.info("No products available to delete.")
 
 def admin_analytics():
     """Calculates and displays profit/loss/revenue and sales graphs."""
-    st.markdown("### 📊 Sales & Financial Performance Tracking")
+    st.markdown("### 📊 Sales & Financial Performance Tracking (Admin Only)")
 
     # Fetch all orders and items for comprehensive analysis
     df_orders = db_manager.fetch_query_df("SELECT * FROM ORDERS")
     
     if df_orders.empty:
-        st.info("No orders placed yet. Financial metrics not available.")
+        st.info("No orders placed yet. Financial metrics not available. Try adding some sample orders!")
         return
 
     # --- KPI Cards ---
@@ -799,6 +843,7 @@ def admin_analytics():
     total_cost = df_orders['total_cost'].sum()
     total_profit = df_orders['total_profit'].sum()
     
+    st.markdown("#### Key Performance Indicators")
     col_rev, col_cogs, col_profit = st.columns(3)
     
     with col_rev:
@@ -817,11 +862,31 @@ def admin_analytics():
     sales_daily = df_orders.groupby('order_date_dt').agg(
         {'total_amount': 'sum', 'total_profit': 'sum'}
     ).reset_index()
-    sales_daily.rename(columns={'total_amount': 'Daily Revenue', 'total_profit': 'Daily Profit'}, inplace=True)
+    sales_daily.rename(columns={'total_amount': 'Daily Revenue', 'total_profit': 'Daily Profit', 'order_date_dt': 'Date'}, inplace=True)
 
     st.markdown("#### Revenue vs. Profit Over Time")
-    st.line_chart(sales_daily, x='order_date_dt', y=['Daily Revenue', 'Daily Profit'])
+    st.line_chart(sales_daily, x='Date', y=['Daily Revenue', 'Daily Profit'])
     
+    # --- Product Sales Breakdown ---
+    # Fetch all order items and join with products
+    query = """
+    SELECT 
+        OI.quantity, 
+        P.name 
+    FROM ORDER_ITEMS OI
+    JOIN PRODUCTS P ON OI.product_id = P.product_id
+    """
+    df_items = db_manager.fetch_query_df(query)
+    
+    if not df_items.empty:
+        st.markdown("#### Product Quantity Breakdown")
+        product_sales_qty = df_items.groupby('name')['quantity'].sum().reset_index()
+        product_sales_qty.rename(columns={'name': 'Product Name', 'quantity': 'Total Quantity Sold'}, inplace=True)
+        
+        # Use a bar chart to visualize product quantity sold
+        st.bar_chart(product_sales_qty, x='Product Name', y='Total Quantity Sold')
+
+
     # --- Order Status Breakdown ---
     st.markdown("#### Order Status Breakdown")
     status_counts = df_orders['status'].value_counts().reset_index()
@@ -850,7 +915,13 @@ def user_profile_management():
             new_username = st.text_input("Name/Nickname", value=current_details['username'])
             
             # Format birthday from DB (ISO string) to date object for widget
-            db_birthday = datetime.date.fromisoformat(current_details['birthday']) if current_details['birthday'] else datetime.date(2000, 1, 1)
+            db_birthday_str = current_details['birthday']
+            if db_birthday_str and db_birthday_str != '2000-01-01': # Check for existing or non-default value
+                 db_birthday = datetime.date.fromisoformat(db_birthday_str)
+            else:
+                 # Default if null or initial value
+                 db_birthday = datetime.date(2000, 1, 1)
+
             new_birthday = st.date_input("Birthday", value=db_birthday)
             
             new_pic_url = st.text_input("Profile Picture URL", value=current_details['profile_pic_url'] or "", placeholder="e.g., https://example.com/pic.jpg")
