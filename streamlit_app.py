@@ -58,6 +58,8 @@ def b64_to_image_html(b64_string, width=150):
     return f'<img src="data:image/png;base64,{b64_string}" width="{width}" style="border-radius: 8px; object-fit: cover; aspect-ratio: 1/1;">'
 
 # --- SAFE DATABASE INITIALIZATION (The Fix) ---
+# NOTE: Renaming the DB file to force a clean start after previous corruption/locks.
+DB_FILENAME = 'tshirt_shop.db' 
 
 @st.cache_resource
 def get_db_connection():
@@ -65,13 +67,21 @@ def get_db_connection():
     Establishes, caches, and initializes the SQLite database connection.
     This function runs only once across all sessions, solving the threading conflict.
     """
-    # check_same_thread=False is crucial for Streamlit's multi-threaded environment.
-    conn = sqlite3.connect('inventory.db', check_same_thread=False, timeout=10) 
-    conn.row_factory = sqlite3.Row 
-    
-    _initialize_db_schema_and_data(conn)
-    
-    return conn
+    try:
+        # check_same_thread=False is crucial for Streamlit's multi-threaded environment.
+        # timeout=10 is added for robust connection attempts.
+        conn = sqlite3.connect(DB_FILENAME, check_same_thread=False, timeout=10) 
+        conn.row_factory = sqlite3.Row 
+        
+        # Initialize schema and data
+        _initialize_db_schema_and_data(conn)
+        
+        return conn
+    except Exception as e:
+        # Log and display fatal error if connection fails
+        st.error(f"FATAL DB ERROR: Could not connect to or initialize database '{DB_FILENAME}'. Reason: {e}")
+        # To prevent the application from continuing with a non-existent database object
+        sys.exit(1) # Stop the script on fatal error
 
 def _initialize_db_schema_and_data(conn):
     """Initializes schema and populates mock data if needed."""
@@ -144,6 +154,8 @@ def _initialize_db_schema_and_data(conn):
         initial_products_data = [
             ("Classic Navy Tee", "T-Shirt", "A basic, comfortable navy tee, perfect for everyday wear.", None),
             ("Summer V-Neck", "T-Shirt", "Lightweight yellow V-neck, great for hot weather.", None),
+            ("Code Debugger Hoodie", "Hoodie", "Warm hoodie for those late-night coding sessions.", None),
+            ("Algorithm Logo Tee", "T-Shirt", "Abstract design based on a sorting algorithm.", None),
         ]
         for name, category, desc, b64_img in initial_products_data:
             c.execute("INSERT OR IGNORE INTO PRODUCTS (name, category, description, base_image_b64) VALUES (?, ?, ?, ?)", 
@@ -1000,7 +1012,7 @@ def main_app():
     # Check for DB connection immediately, it handles initialization via cache
     db = get_db_connection()
     if db is None:
-        st.error("FATAL ERROR: Could not establish database connection.")
+        # get_db_connection handles the error display, we just stop the script.
         return
 
     with st.sidebar:
