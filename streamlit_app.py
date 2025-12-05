@@ -17,75 +17,103 @@ PRODUCT_ID = 1  # Fixed ID for the single T-shirt product
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-# FIX: @st.cache_resource is the right tool, but we must make the function 
-# entirely passive and database-focused, removing all internal st. calls 
-# and relying on explicit SELECTs instead of catching IntegrityError, 
-# which can sometimes be mistaken for OperationalError.
+# Using @st.cache_resource is mandatory for thread-safe SQLite access in Streamlit.
+# We ensure the function is strictly database logic and idempotent.
 @st.cache_resource(show_spinner=False)
 def get_db_connection_and_init():
-    """Initializes the database, creates tables, populates initial data,
-    and returns a thread-safe connection object."""
+    """
+    Initializes the database, creates tables, and returns a thread-safe connection.
+    This function must be idempotent (safe to call multiple times).
+    """
     
-    # 1. Establish Connection (set check_same_thread=False for Streamlit environment)
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-    c = conn.cursor()
+    try:
+        # 1. Establish Connection (set check_same_thread=False for Streamlit environment)
+        # We ensure a new connection is established safely inside the cached function.
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+        c = conn.cursor()
 
-    # 2. Define all necessary tables (This part is fast and safe)
-    c.executescript('''
-        CREATE TABLE IF NOT EXISTS USERS (
-            username TEXT PRIMARY KEY,
-            password_hash TEXT,
-            role TEXT
-        );
+        # 2. Define all necessary tables
+        # Using separate CREATE TABLE statements for robustness instead of executescript
+        # to ensure each table command is executed distinctly.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS USERS (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT,
+                role TEXT
+            )
+        ''')
+        
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS PRODUCTS (
+                product_id INTEGER PRIMARY KEY,
+                name TEXT,
+                description TEXT,
+                price REAL,
+                stock INTEGER
+            )
+        ''')
+        
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS ORDERS (
+                order_id TEXT PRIMARY KEY,
+                username TEXT,
+                order_date TEXT,
+                total_amount REAL,
+                status TEXT,
+                -- Added shipping details as per checkout form
+                full_name TEXT,
+                address TEXT,
+                city TEXT,
+                zip_code TEXT,
+                FOREIGN KEY (username) REFERENCES USERS(username)
+            )
+        ''')
 
-        CREATE TABLE IF NOT EXISTS PRODUCTS (
-            product_id INTEGER PRIMARY KEY,
-            name TEXT,
-            description TEXT,
-            price REAL,
-            stock INTEGER
-        );
-
-        CREATE TABLE IF NOT EXISTS ORDERS (
-            order_id TEXT PRIMARY KEY,
-            username TEXT,
-            order_date TEXT,
-            total_amount REAL,
-            status TEXT,
-            FOREIGN KEY (username) REFERENCES USERS(username)
-        );
-
-        CREATE TABLE IF NOT EXISTS ORDER_ITEMS (
-            item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id TEXT,
-            product_id INTEGER,
-            size TEXT,
-            quantity INTEGER,
-            unit_price REAL,
-            FOREIGN KEY (order_id) REFERENCES ORDERS(order_id),
-            FOREIGN KEY (product_id) REFERENCES PRODUCTS(product_id)
-        );
-    ''')
-    conn.commit()
-
-    # 3. Add initial users (Idempotent: using SELECT to check existence)
-    # Check if the 'admin' user exists
-    c.execute("SELECT COUNT(*) FROM USERS WHERE username = 'admin'")
-    if c.fetchone()[0] == 0:
-        c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
-        c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
+        # The column that was missing: product_id must be correctly referenced here.
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS ORDER_ITEMS (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT,
+                product_id INTEGER, -- CRITICAL: Ensure this column exists
+                size TEXT,
+                quantity INTEGER,
+                unit_price REAL,
+                FOREIGN KEY (order_id) REFERENCES ORDERS(order_id),
+                FOREIGN KEY (product_id) REFERENCES PRODUCTS(product_id)
+            )
+        ''')
         conn.commit()
 
-    # 4. Add initial product data if not present (using SELECT to check existence)
-    c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
-    product_data_exists = c.fetchone()
-    
-    if product_data_exists is None:
-        c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
-                  (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
-        conn.commit()
+        # 3. Add initial users (Idempotent check)
+        c.execute("SELECT COUNT(*) FROM USERS WHERE username = 'admin'")
+        if c.fetchone()[0] == 0:
+            c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
+            c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
+            conn.commit()
 
-    return conn
+        # 4. Add initial product data (Idempotent check)
+        c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
+        if c.fetchone() is None:
+            c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
+                      (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
+            conn.commit()
+
+        return conn
+    
+    except sqlite3.OperationalError as e:
+        # If any OperationalError (like database lock) occurs during setup, 
+        # we clear the cache and force a restart to clear the lock.
+        st.error("Database initialization failed due to a lock. Clearing cache and restarting...")
+        st.cache_resource.clear()
+        st.rerun()
+        return None
+    except Exception as e:
+        # Handle generic unexpected errors during initialization
+        st.error(f"Critical error during database setup: {e}. Clearing cache.")
+        st.cache_resource.clear()
+        st.rerun()
+        return None
+
 
 # Helper function to get the cached connection
 def get_db_connection():
@@ -112,7 +140,6 @@ def add_user(username, password):
     except sqlite3.IntegrityError:
         return False
     except sqlite3.OperationalError:
-        # Handle lock if it occurs during sign up
         conn.rollback()
         st.warning("Database busy. Please try again.")
         return False
@@ -120,12 +147,18 @@ def add_user(username, password):
 def get_product_details(product_id):
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT * FROM PRODUCTS WHERE product_id = ?", (product_id,))
-    row = c.fetchone()
-    if row:
-        return {'product_id': row[0], 'name': row[1], 'description': row[2], 'price': row[3], 'stock': row[4]}
+    # Ensure this query runs safely
+    try:
+        c.execute("SELECT * FROM PRODUCTS WHERE product_id = ?", (product_id,))
+        row = c.fetchone()
+        if row:
+            return {'product_id': row[0], 'name': row[1], 'description': row[2], 'price': row[3], 'stock': row[4]}
+    except sqlite3.OperationalError as e:
+        st.error(f"Error accessing PRODUCTS table: {e}. Try refreshing.")
+        return None
     return None
 
+# Updated place_order signature to save shipping details
 def place_order(username, cart_items, total_amount, full_name, address, city, zip_code):
     conn = get_db_connection()
     c = conn.cursor()
@@ -133,13 +166,12 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
     order_date = datetime.datetime.now().isoformat()
 
     try:
-        # 1. Insert into ORDERS table
-        c.execute("INSERT INTO ORDERS (order_id, username, order_date, total_amount, status) VALUES (?, ?, ?, ?, ?)",
-                  (order_id, username, order_date, total_amount, 'Processing'))
+        # 1. Insert into ORDERS table (Now includes shipping fields)
+        c.execute("INSERT INTO ORDERS (order_id, username, order_date, total_amount, status, full_name, address, city, zip_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (order_id, username, order_date, total_amount, 'Processing', full_name, address, city, zip_code))
 
         # 2. Insert into ORDER_ITEMS and update stock
         for item in cart_items:
-            # Re-fetch product details to get current stock just before placing the order
             product = get_product_details(item['product_id']) 
             if product and product['stock'] >= item['quantity']:
                 # Insert item
@@ -150,20 +182,20 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
                 new_stock = product['stock'] - item['quantity']
                 c.execute("UPDATE PRODUCTS SET stock = ? WHERE product_id = ?", (new_stock, item['product_id']))
             else:
-                conn.rollback() # Use rollback on failure
+                conn.rollback() 
                 return False, "Error: Insufficient stock for product ID {}".format(item['product_id'])
 
         conn.commit()
         return True, order_id
 
     except Exception as e:
-        conn.rollback() # Use rollback on failure
-        if isinstance(e, sqlite3.OperationalError) and 'database is locked' in str(e):
+        conn.rollback() 
+        if isinstance(e, sqlite3.OperationalError):
              st.error("The database is currently busy. Please try completing your order again.")
              return False, "Database busy."
         else:
              st.error(f"Database error during order placement: {e}")
-             return False, f"Order failed due to an internal error. {e}"
+             return False, f"Order failed due to an internal error: {e}"
 
 
 # --- Streamlit Page Functions ---
@@ -212,7 +244,7 @@ def product_page():
 
     product = get_product_details(PRODUCT_ID)
     if not product:
-        st.error("Product not found.")
+        st.error("Product details are currently unavailable.")
         return
 
     st.subheader(product['name'])
@@ -225,28 +257,24 @@ def product_page():
 
     st.subheader("Select Options")
     
-    # Initialize cart if it doesn't exist
     if 'cart' not in st.session_state:
         st.session_state['cart'] = []
-
-    # Get the existing item in cart, if any, for pre-filling
-    existing_item = next((item for item in st.session_state['cart'] if item['product_id'] == PRODUCT_ID), None)
 
     col_size, col_qty, col_add = st.columns([1, 1, 1])
 
     with col_size:
-        size = st.selectbox("Size", ['S', 'M', 'L', 'XL'], index=1)
+        size = st.selectbox("Size", ['S', 'M', 'L', 'XL'], index=1, key="select_size")
     
     with col_qty:
-        # Use existing quantity or default to 1
-        default_qty = existing_item['quantity'] if existing_item and existing_item['size'] == size else 1
-        quantity = st.number_input("Quantity", min_value=1, max_value=product['stock'], value=default_qty, step=1)
+        # Find quantity of this specific size in the cart for default value
+        existing_item = next((item for item in st.session_state['cart'] if item['product_id'] == PRODUCT_ID and item['size'] == size), None)
+        default_qty = existing_item['quantity'] if existing_item else 1
+        quantity = st.number_input("Quantity", min_value=1, max_value=product['stock'], value=default_qty, step=1, key="select_quantity")
     
     with col_add:
-        st.markdown("<br>", unsafe_allow_html=True) # Add vertical space
+        st.markdown("<br>", unsafe_allow_html=True)
         if st.button("Add to Cart"):
             if quantity > 0 and quantity <= product['stock']:
-                # Create the item dict
                 new_item = {
                     'product_id': PRODUCT_ID,
                     'name': product['name'],
@@ -256,28 +284,22 @@ def product_page():
                     'total': quantity * product['price']
                 }
 
-                # Update cart: remove old entry for this product and size, then add new one
-                # Note: The logic below removes ALL items with the same product_id regardless of size. 
-                # A more correct cart would keep separate sizes. Let's fix that.
-                
-                # Check if an item with the exact same size already exists
                 cart_updated = False
                 for i in range(len(st.session_state['cart'])):
                     item = st.session_state['cart'][i]
+                    # Check for exact product ID AND size match
                     if item['product_id'] == PRODUCT_ID and item['size'] == size:
-                        # Update quantity of existing item
                         st.session_state['cart'][i]['quantity'] = quantity
                         st.session_state['cart'][i]['total'] = quantity * item['price']
                         cart_updated = True
                         break
                 
                 if not cart_updated:
-                    # If not found, append the new item
                     st.session_state['cart'].append(new_item)
 
                 st.toast(f"{quantity}x {size} {product['name']} added/updated in cart!")
             else:
-                st.error("Invalid quantity.")
+                st.error("Invalid quantity or insufficient stock.")
 
 def checkout_page():
     st.title("Checkout")
@@ -290,6 +312,11 @@ def checkout_page():
         return
 
     st.subheader("Order Summary")
+    # Handle the case where cart is present but empty (though warning above should catch it)
+    if not st.session_state['cart']:
+        st.warning("Your cart is empty.")
+        return
+        
     cart_df = pd.DataFrame(st.session_state['cart'])
     cart_df['Unit Price'] = cart_df['price'].apply(lambda x: f"${x:.2f}")
     cart_df['Total Price'] = cart_df['total'].apply(lambda x: f"${x:.2f}")
@@ -302,7 +329,6 @@ def checkout_page():
     st.subheader("Shipping Information")
 
     with st.form("checkout_form"):
-        # Pre-fill name from session state if available
         default_name = st.session_state.get('username', '').capitalize() or ""
 
         full_name = st.text_input("Full Name", value=default_name, required=True, key="checkout_full_name")
@@ -314,11 +340,9 @@ def checkout_page():
         with col_zip:
             zip_code = st.text_input("Zip Code", required=True, key="checkout_zip")
         
-        # MANDATORY SUBMIT BUTTON FOR THE FORM
         submitted = st.form_submit_button("Complete Order")
 
         if submitted:
-            # Check for required fields
             if not all([full_name, address, city, zip_code]):
                 st.error("Please fill in all shipping fields.")
             else:
@@ -334,7 +358,6 @@ def checkout_page():
                 
                 if success:
                     st.success(f"Order successfully placed! Your Order ID is: {result}")
-                    # Clear the cart and navigate to the order confirmation page or shop
                     st.session_state['cart'] = []
                     st.balloons()
                     st.session_state['page'] = 'order_complete'
@@ -346,7 +369,7 @@ def order_complete_page():
     order_id = st.session_state.get('last_order_id', 'N/A')
     st.success(f"Thank you for your purchase, {st.session_state['username'].capitalize()}!")
     st.markdown(f"Your order ID is: **{order_id}**")
-    st.info("You will receive a confirmation email shortly. You can track your order in the dashboard.")
+    st.info("You can track your order in the dashboard.")
 
     if st.button("Continue Shopping"):
         st.session_state['page'] = 'shop'
@@ -357,23 +380,35 @@ def dashboard_page():
     st.subheader(f"Welcome, {st.session_state['username'].capitalize()}")
 
     conn = get_db_connection()
-    df_orders = pd.read_sql_query("SELECT order_id, order_date, total_amount, status FROM ORDERS WHERE username = ? ORDER BY order_date DESC", 
-                                  conn, params=(st.session_state['username'],))
+
+    try:
+        # Retrieve necessary columns from ORDERS
+        df_orders = pd.read_sql_query("SELECT order_id, order_date, total_amount, status, full_name, address, city, zip_code FROM ORDERS WHERE username = ? ORDER BY order_date DESC", 
+                                      conn, params=(st.session_state['username'],))
+    except pd.io.sql.DatabaseError as e:
+        # Explicitly catch the error if the column is missing at runtime
+        st.error(f"Could not retrieve orders. Database schema error: {e}")
+        st.info("The application will attempt to re-initialize the database on the next load. Please try refreshing.")
+        return
 
     if df_orders.empty:
         st.info("You have no past orders.")
     else:
         st.subheader("Your Order History")
-        st.dataframe(df_orders, hide_index=True, use_container_width=True)
+        # Display only core order info for simplicity in the main view
+        display_cols = ['order_id', 'order_date', 'total_amount', 'status']
+        st.dataframe(df_orders[display_cols], hide_index=True, use_container_width=True)
 
     if st.session_state['username'] == 'admin':
         st.subheader("Admin Panel")
-        df_all_orders = pd.read_sql_query("SELECT * FROM ORDERS", conn)
-        df_products = pd.read_sql_query("SELECT * FROM PRODUCTS", conn)
         
+        # Load all orders (with shipping info for admin)
+        df_all_orders = pd.read_sql_query("SELECT * FROM ORDERS", conn)
         st.markdown("#### All Orders")
         st.dataframe(df_all_orders, hide_index=True, use_container_width=True)
         
+        # Load products
+        df_products = pd.read_sql_query("SELECT * FROM PRODUCTS", conn)
         st.markdown("#### Product Stock")
         st.dataframe(df_products, hide_index=True, use_container_width=True)
 
@@ -383,17 +418,16 @@ def main_app():
     """The main entry point for the Streamlit application."""
     
     # 1. Initialize DB Connection using the cached function
-    # This must run first. If it returns None (due to a critical error), the app must stop.
     conn = get_db_connection_and_init() 
     if conn is None:
-        # A serious error occurred, but the caching function should prevent this now.
-        # If we reach here, Streamlit has failed to render anything.
-        st.stop()
+        # get_db_connection_and_init handles its own errors and reruns, 
+        # so if it returns None, we stop execution here.
+        return 
 
     # 2. Initialize session state variables
     if 'logged_in' not in st.session_state:
         st.session_state['logged_in'] = False
-        st.session_state['page'] = 'login' # Start at login page
+        st.session_state['page'] = 'login' 
 
     if 'page' not in st.session_state:
         st.session_state['page'] = 'shop'
@@ -451,4 +485,5 @@ if __name__ == '__main__':
     try:
         main_app()
     except Exception as e:
+        # A friendly message for the user, while the cache clearing happens inside the DB function
         st.error(f"An unexpected error occurred during application runtime. Please refresh the page. Error: {e}")
