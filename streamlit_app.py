@@ -4,35 +4,43 @@ import hashlib
 import uuid
 import datetime
 import pandas as pd
-import requests
-import json
-from io import BytesIO
+from threading import Lock
+import os
 
 # --- Constants and Configuration ---
 DB_NAME = 'tshirt_shop.db'
 PRODUCT_ID = 1  # Fixed ID for the single T-shirt product
 
-# --- Database Initialization and Connection ---
-
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-# Using @st.cache_resource is mandatory for thread-safe SQLite access in Streamlit.
-# We ensure the function is strictly database logic and idempotent.
-@st.cache_resource(show_spinner=False)
-def get_db_connection_and_init():
+# --- Database Management Class (The Guarantee) ---
+class DBManager:
     """
-    Initializes the database, creates tables, and returns a thread-safe connection.
-    This function is now highly robust against database locks using a timeout.
+    Manages the SQLite connection and enforces thread safety using a Lock.
+    This ensures only one Streamlit thread accesses the database at a time.
     """
-    conn = None
-    try:
-        # 1. Establish Connection with a long timeout (10 seconds)
-        # This gives time for competing processes to finish their transactions.
-        conn = sqlite3.connect(DB_NAME, check_same_thread=False, timeout=10)
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self._lock = Lock()
+        self._conn = None
+        self._initialize_db()
+
+    def _get_connection(self):
+        """Creates or returns the connection, ensuring only one connection exists."""
+        if self._conn is None:
+            # Use a longer timeout and set check_same_thread=False because Streamlit is multi-threaded
+            # and we are using a manual Lock.
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
+            self._conn.row_factory = sqlite3.Row # Ensure we can access columns by name
+        return self._conn
+
+    def _initialize_db(self):
+        """Creates tables and populates initial data idempotently."""
+        conn = self._get_connection()
         c = conn.cursor()
-
-        # 2. Define all necessary tables (Explicit CREATE TABLE statements for robustness)
+        
+        # 1. Define all necessary tables
+        # Note: We must redefine the tables to ensure the correct schema is applied, 
+        # especially if the database file was created with an older version.
+        
         c.execute('''
             CREATE TABLE IF NOT EXISTS USERS (
                 username TEXT PRIMARY KEY,
@@ -80,121 +88,163 @@ def get_db_connection_and_init():
         ''')
         conn.commit()
 
-        # 3. Add initial users (Idempotent check)
+        # 2. Add initial users (Idempotent check)
         c.execute("SELECT COUNT(*) FROM USERS WHERE username = 'admin'")
         if c.fetchone()[0] == 0:
             c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
             c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
             conn.commit()
 
-        # 4. Add initial product data (Idempotent check)
+        # 3. Add initial product data (Idempotent check)
         c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
         if c.fetchone() is None:
             c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
                       (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
             conn.commit()
 
-        return conn
-    
-    except sqlite3.OperationalError as e:
-        # Crucial step: Explicitly close the connection to release the lock handle
-        if conn:
-            conn.close()
-        
-        # Clear the cache and force a restart to try again
-        st.error(f"Database initialization failed due to a lock ({e}). Clearing cache and restarting...")
-        st.cache_resource.clear()
-        st.rerun()
-        return None
-        
-    except Exception as e:
-        if conn:
-            conn.close()
-        st.error(f"Critical error during database setup: {e}. Clearing cache.")
-        st.cache_resource.clear()
-        st.rerun()
-        return None
+    def execute_query(self, query, params=(), commit=False):
+        """Executes a non-SELECT query with thread lock protection."""
+        with self._lock:
+            conn = self._get_connection()
+            c = conn.cursor()
+            try:
+                c.execute(query, params)
+                if commit:
+                    conn.commit()
+                return c
+            except sqlite3.OperationalError as e:
+                # Rollback/re-raise if a query operation fails
+                conn.rollback()
+                raise e
+            except Exception as e:
+                conn.rollback()
+                raise e
 
+    def fetch_query(self, query, params=()):
+        """Executes a SELECT query and fetches results with thread lock protection."""
+        with self._lock:
+            conn = self._get_connection()
+            c = conn.cursor()
+            try:
+                c.execute(query, params)
+                return c.fetchall()
+            except Exception as e:
+                raise e
 
-# Helper function to get the cached connection
-def get_db_connection():
-    """Returns the cached database connection object."""
-    return get_db_connection_and_init()
+    def fetch_query_df(self, query, params=()):
+        """Executes a SELECT query and fetches results as a Pandas DataFrame."""
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                df = pd.read_sql_query(query, conn, params=params)
+                return df
+            except Exception as e:
+                raise e
 
+# --- Global Database Manager Instance ---
+# Use @st.cache_resource to create a single, shared instance of the DBManager
+# that exists across all sessions and handles internal locking.
+@st.cache_resource
+def get_db_manager():
+    """Initializes and returns the thread-safe DBManager instance."""
+    # If the database file exists and is locked, deleting it before initialization
+    # can often resolve the most stubborn locks from a previous failed run.
+    if os.path.exists(DB_NAME) and not os.access(DB_NAME, os.W_OK):
+        try:
+            os.remove(DB_NAME)
+            # The st.warning below is removed to avoid triggering a rerun loop,
+            # trusting the DBManager to handle the initialization now.
+        except:
+            pass # Ignore if removal fails
+
+    return DBManager(DB_NAME)
+
+db_manager = get_db_manager()
+
+# --- Helper Functions Adapted to DBManager ---
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
 def verify_user(username, password):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT password_hash FROM USERS WHERE username = ?", (username,))
-    result = c.fetchone()
-    if result:
-        return result[0] == hash_password(password)
-    return False
+    try:
+        users = db_manager.fetch_query("SELECT password_hash FROM USERS WHERE username = ?", (username,))
+        if users:
+            # users[0] is an sqlite3.Row object, access by name
+            return users[0]['password_hash'] == hash_password(password)
+        return False
+    except Exception as e:
+        st.error(f"Error verifying user: {e}")
+        return False
 
 def add_user(username, password):
-    conn = get_db_connection()
-    c = conn.cursor()
     try:
-        c.execute("INSERT INTO USERS VALUES (?, ?, ?)", (username, hash_password(password), 'customer'))
-        conn.commit()
+        db_manager.execute_query("INSERT INTO USERS VALUES (?, ?, ?)", 
+                                 (username, hash_password(password), 'customer'), 
+                                 commit=True)
         return True
     except sqlite3.IntegrityError:
         return False
     except sqlite3.OperationalError:
-        conn.rollback()
         st.warning("Database busy. Please try again.")
+        return False
+    except Exception as e:
+        st.error(f"Error adding user: {e}")
         return False
 
 def get_product_details(product_id):
-    conn = get_db_connection()
-    c = conn.cursor()
     try:
-        c.execute("SELECT * FROM PRODUCTS WHERE product_id = ?", (product_id,))
-        row = c.fetchone()
-        if row:
-            return {'product_id': row[0], 'name': row[1], 'description': row[2], 'price': row[3], 'stock': row[4]}
-    except sqlite3.OperationalError as e:
-        st.error(f"Error accessing PRODUCTS table: {e}. Try refreshing.")
+        products = db_manager.fetch_query("SELECT * FROM PRODUCTS WHERE product_id = ?", (product_id,))
+        if products:
+            row = products[0]
+            # Accessing columns by name using the set row_factory
+            return {'product_id': row['product_id'], 'name': row['name'], 'description': row['description'], 'price': row['price'], 'stock': row['stock']}
+    except Exception as e:
+        st.error(f"Error accessing product details: {e}. Try refreshing.")
         return None
     return None
 
 def place_order(username, cart_items, total_amount, full_name, address, city, zip_code):
-    conn = get_db_connection()
-    c = conn.cursor()
     order_id = str(uuid.uuid4())
     order_date = datetime.datetime.now().isoformat()
 
     try:
-        # 1. Insert into ORDERS table 
-        c.execute("INSERT INTO ORDERS (order_id, username, order_date, total_amount, status, full_name, address, city, zip_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                  (order_id, username, order_date, total_amount, 'Processing', full_name, address, city, zip_code))
+        # Acquire Lock and perform transaction
+        with db_manager._lock:
+            conn = db_manager._get_connection()
+            c = conn.cursor()
+            
+            # 1. Insert into ORDERS table 
+            c.execute("INSERT INTO ORDERS (order_id, username, order_date, total_amount, status, full_name, address, city, zip_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (order_id, username, order_date, total_amount, 'Processing', full_name, address, city, zip_code))
 
-        # 2. Insert into ORDER_ITEMS and update stock
-        for item in cart_items:
-            product = get_product_details(item['product_id']) 
-            if product and product['stock'] >= item['quantity']:
-                # Insert item
-                c.execute("INSERT INTO ORDER_ITEMS (order_id, product_id, size, quantity, unit_price) VALUES (?, ?, ?, ?, ?)",
-                          (order_id, item['product_id'], item['size'], item['quantity'], item['price']))
+            # 2. Insert into ORDER_ITEMS and update stock
+            for item in cart_items:
+                # Stock check MUST use the correct column name 'stock'
+                c.execute("SELECT stock FROM PRODUCTS WHERE product_id = ?", (item['product_id'],))
+                product_stock = c.fetchone()
+                
+                if product_stock and product_stock[0] >= item['quantity']:
+                    # Insert item
+                    c.execute("INSERT INTO ORDER_ITEMS (order_id, product_id, size, quantity, unit_price) VALUES (?, ?, ?, ?, ?)",
+                            (order_id, item['product_id'], item['size'], item['quantity'], item['price']))
 
-                # Update stock
-                new_stock = product['stock'] - item['quantity']
-                c.execute("UPDATE PRODUCTS SET stock = ? WHERE product_id = ?", (new_stock, item['product_id']))
-            else:
-                conn.rollback() 
-                return False, "Error: Insufficient stock for product ID {}".format(item['product_id'])
+                    # Update stock
+                    new_stock = product_stock[0] - item['quantity']
+                    c.execute("UPDATE PRODUCTS SET stock = ? WHERE product_id = ?", (new_stock, item['product_id']))
+                else:
+                    conn.rollback() 
+                    return False, f"Error: Insufficient stock for product ID {item['product_id']} (Requested: {item['quantity']}, Available: {product_stock[0] if product_stock else 0})"
 
-        conn.commit()
-        return True, order_id
+            conn.commit()
+            return True, order_id
 
+    except sqlite3.OperationalError:
+         # Lock is handled by the DBManager, this usually means a timeout or IO issue
+         return False, "Database busy. Please try completing your order again."
     except Exception as e:
-        conn.rollback() 
-        if isinstance(e, sqlite3.OperationalError):
-             st.error("The database is currently busy. Please try completing your order again.")
-             return False, "Database busy."
-        else:
-             st.error(f"Database error during order placement: {e}")
-             return False, f"Order failed due to an internal error: {e}"
+         st.error(f"Database error during order placement: {e}")
+         return False, f"Order failed due to an internal error: {e}"
 
 
 # --- Streamlit Page Functions ---
@@ -244,6 +294,7 @@ def product_page():
     product = get_product_details(PRODUCT_ID)
     if not product:
         st.error("Product details are currently unavailable.")
+        # If product details are missing, show a message and stop rendering this page
         return
 
     st.subheader(product['name'])
@@ -359,6 +410,8 @@ def checkout_page():
                     st.session_state['page'] = 'order_complete'
                     st.session_state['last_order_id'] = result
                     st.rerun()
+                else:
+                    st.error(f"Order failed: {result}")
 
 def order_complete_page():
     st.title("Order Confirmed!")
@@ -375,12 +428,11 @@ def dashboard_page():
     st.title("User Dashboard")
     st.subheader(f"Welcome, {st.session_state['username'].capitalize()}")
 
-    conn = get_db_connection()
-
     try:
-        df_orders = pd.read_sql_query("SELECT order_id, order_date, total_amount, status, full_name, address, city, zip_code FROM ORDERS WHERE username = ? ORDER BY order_date DESC", 
-                                      conn, params=(st.session_state['username'],))
-    except pd.io.sql.DatabaseError as e:
+        # Fetch order history using the DBManager's thread-safe method
+        df_orders = db_manager.fetch_query_df("SELECT order_id, order_date, total_amount, status, full_name, address, city, zip_code FROM ORDERS WHERE username = ? ORDER BY order_date DESC", 
+                                      params=(st.session_state['username'],))
+    except Exception as e:
         st.error(f"Could not retrieve orders. Database error: {e}")
         st.info("Please try refreshing the page.")
         return
@@ -395,11 +447,13 @@ def dashboard_page():
     if st.session_state['username'] == 'admin':
         st.subheader("Admin Panel")
         
-        df_all_orders = pd.read_sql_query("SELECT * FROM ORDERS", conn)
+        # Load all orders for admin
+        df_all_orders = db_manager.fetch_query_df("SELECT * FROM ORDERS")
         st.markdown("#### All Orders")
         st.dataframe(df_all_orders, hide_index=True, use_container_width=True)
         
-        df_products = pd.read_sql_query("SELECT * FROM PRODUCTS", conn)
+        # Load products for admin
+        df_products = db_manager.fetch_query_df("SELECT * FROM PRODUCTS")
         st.markdown("#### Product Stock")
         st.dataframe(df_products, hide_index=True, use_container_width=True)
 
@@ -408,13 +462,10 @@ def dashboard_page():
 def main_app():
     """The main entry point for the Streamlit application."""
     
-    # 1. Initialize DB Connection using the cached function
-    conn = get_db_connection_and_init() 
-    if conn is None:
-        # If initialization fails and returns None, the app stops here.
-        return 
+    # DB Manager is initialized and ready due to @st.cache_resource
+    # We no longer need to check for a returned connection object
 
-    # 2. Initialize session state variables
+    # 1. Initialize session state variables
     if 'logged_in' not in st.session_state:
         st.session_state['logged_in'] = False
         st.session_state['page'] = 'login' 
@@ -474,4 +525,5 @@ if __name__ == '__main__':
     try:
         main_app()
     except Exception as e:
-        st.error(f"An unexpected error occurred during application runtime. Please refresh the page. Error: {e}")
+        # Generic catch-all for anything outside of the database logic
+        st.error(f"An unexpected application error occurred. Please refresh the page. Error: {e}")
