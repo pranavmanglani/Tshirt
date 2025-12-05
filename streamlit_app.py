@@ -6,6 +6,7 @@ import datetime
 import pandas as pd
 from threading import Lock
 import os
+import time
 
 # --- Constants and Configuration ---
 DB_NAME = 'tshirt_shop.db'
@@ -26,9 +27,8 @@ class DBManager:
     def _get_connection(self):
         """Creates or returns the connection, ensuring only one connection exists."""
         if self._conn is None:
-            # Use a longer timeout and set check_same_thread=False because Streamlit is multi-threaded
-            # and we are using a manual Lock.
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10)
+            # Use a longer timeout (30s) and set check_same_thread=False
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
             self._conn.row_factory = sqlite3.Row # Ensure we can access columns by name
         return self._conn
 
@@ -37,10 +37,7 @@ class DBManager:
         conn = self._get_connection()
         c = conn.cursor()
         
-        # 1. Define all necessary tables
-        # Note: We must redefine the tables to ensure the correct schema is applied, 
-        # especially if the database file was created with an older version.
-        
+        # 1. Define all necessary tables using IF NOT EXISTS
         c.execute('''
             CREATE TABLE IF NOT EXISTS USERS (
                 username TEXT PRIMARY KEY,
@@ -96,6 +93,7 @@ class DBManager:
             conn.commit()
 
         # 3. Add initial product data (Idempotent check)
+        # This is the query that failed due to the lock in the previous run:
         c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
         if c.fetchone() is None:
             c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
@@ -136,28 +134,53 @@ class DBManager:
         with self._lock:
             conn = self._get_connection()
             try:
+                # pd.read_sql_query handles its own concurrency mechanism, which benefits from the Lock outside
                 df = pd.read_sql_query(query, conn, params=params)
                 return df
             except Exception as e:
                 raise e
 
 # --- Global Database Manager Instance ---
-# Use @st.cache_resource to create a single, shared instance of the DBManager
-# that exists across all sessions and handles internal locking.
 @st.cache_resource
 def get_db_manager():
-    """Initializes and returns the thread-safe DBManager instance."""
-    # If the database file exists and is locked, deleting it before initialization
-    # can often resolve the most stubborn locks from a previous failed run.
-    if os.path.exists(DB_NAME) and not os.access(DB_NAME, os.W_OK):
+    """
+    Initializes and returns the thread-safe DBManager instance. 
+    Includes aggressive lock resolution and retries.
+    """
+    
+    max_retries = 3
+    
+    for attempt in range(max_retries):
         try:
-            os.remove(DB_NAME)
-            # The st.warning below is removed to avoid triggering a rerun loop,
-            # trusting the DBManager to handle the initialization now.
-        except:
-            pass # Ignore if removal fails
+            # Step 1: Attempt to establish a test connection immediately
+            test_conn = sqlite3.connect(DB_NAME, timeout=5)
+            test_conn.close()
 
-    return DBManager(DB_NAME)
+            # If connection is successful, initialize the manager
+            return DBManager(DB_NAME)
+
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e) and os.path.exists(DB_NAME) and attempt < max_retries - 1:
+                # Step 2: Aggressive lock resolution by deleting the file
+                st.warning(f"Attempt {attempt + 1}: Database is locked. Deleting and recreating the file for a clean start...")
+                try:
+                    os.remove(DB_NAME)
+                    st.toast("Database file successfully deleted. Retrying initialization.")
+                    time.sleep(1) # Give the OS time to release the file handle
+                    continue # Retry the loop
+                except Exception as file_error:
+                    st.error(f"Failed to delete locked database file: {file_error}. Retrying...")
+                    time.sleep(2)
+            else:
+                # If it's the last attempt or a different error, re-raise
+                st.error(f"Failed to initialize database after {attempt + 1} attempts due to a lock or error: {e}")
+                raise e
+        except Exception as e:
+            st.error(f"An unexpected error occurred during database setup: {e}")
+            raise e
+            
+    # Should be unreachable, but good practice to handle all paths
+    raise Exception("Database initialization failed permanently after retries.")
 
 db_manager = get_db_manager()
 
@@ -463,7 +486,6 @@ def main_app():
     """The main entry point for the Streamlit application."""
     
     # DB Manager is initialized and ready due to @st.cache_resource
-    # We no longer need to check for a returned connection object
 
     # 1. Initialize session state variables
     if 'logged_in' not in st.session_state:
