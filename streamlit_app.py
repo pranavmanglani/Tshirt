@@ -38,84 +38,90 @@ def init_db():
     conn = get_db_connection()
     c = conn.cursor()
 
-    # Define all necessary tables (DDL)
-    c.executescript('''
-        CREATE TABLE IF NOT EXISTS USERS (
-            username TEXT PRIMARY KEY,
-            email TEXT NOT NULL UNIQUE, 
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS DESIGNS (
-            design_id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL UNIQUE,
-            description TEXT,
-            price_usd REAL NOT NULL DEFAULT 19.99
-        );
-
-        CREATE TABLE IF NOT EXISTS PRODUCTION_LOG (
-            log_id INTEGER PRIMARY KEY,
-            log_date TEXT NOT NULL,
-            product_name TEXT NOT NULL,
-            size TEXT NOT NULL,
-            units_produced INTEGER NOT NULL,
-            defects INTEGER NOT NULL
-        );
-    ''')
-    conn.close() # Close the connection used for DDL
-
-    # Add initial data if tables are empty (DML)
     try:
-        conn = get_db_connection() # Open a new connection for DML
-        c = conn.cursor()
+        # Define all necessary tables (DDL)
+        c.executescript('''
+            CREATE TABLE IF NOT EXISTS USERS (
+                username TEXT PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE, 
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS DESIGNS (
+                design_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                price_usd REAL NOT NULL DEFAULT 19.99
+            );
+
+            CREATE TABLE IF NOT EXISTS PRODUCTION_LOG (
+                log_id INTEGER PRIMARY KEY,
+                log_date TEXT NOT NULL,
+                product_name TEXT NOT NULL,
+                size TEXT NOT NULL,
+                units_produced INTEGER NOT NULL,
+                defects INTEGER NOT NULL
+            );
+        ''')
         
-        # Check and insert initial users
+        # --- Populate Initial Data (DML) ---
+        
+        # 1. Check and insert initial users
         if not c.execute("SELECT 1 FROM USERS").fetchone():
             c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
                       ('admin', 'admin@company.com', hash_password('adminpass'), 'admin'))
             c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
                       ('customer1', 'cust1@email.com', hash_password('customerpass'), 'customer'))
 
-        # Check and insert initial designs
+        # 2. Check and insert initial designs
         if not c.execute("SELECT 1 FROM DESIGNS").fetchone():
             c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Logo Tee', 'Standard company logo print', 24.99))
             c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Abstract Art', 'Limited edition vibrant print', 35.50))
             c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Vintage Stripes', 'Classic striped design', 19.99))
+            c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Holiday Special', 'Seasonal festive design', 29.00))
 
-        # Check and insert mock production logs (10 days of data)
+
+        # 3. Check and insert mock production logs (Sample data for the last 30 days)
         if not c.execute("SELECT 1 FROM PRODUCTION_LOG").fetchone():
             today = datetime.now().date()
             data = []
             
-            # Generate data for the last 10 days
-            for i in range(1, 11):
+            # Generate data for the last 30 days
+            for i in range(1, 31):
                 log_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
                 
-                # Design 1: Logo Tee (High volume, low defect rate)
-                data.append((log_date, 'Logo Tee', 'M', 100 + i*10, 5 + (i//3)))
-                data.append((log_date, 'Logo Tee', 'L', 120 + i*5, 4 + (i//4)))
+                # Logo Tee (Consistent, high volume)
+                data.append((log_date, 'Logo Tee', 'M', 100 + i*2, 5 + (i//5)))
+                data.append((log_date, 'Logo Tee', 'L', 120 + i*1, 4 + (i//6)))
 
-                # Design 2: Abstract Art (Medium volume, medium defect rate)
-                data.append((log_date, 'Abstract Art', 'S', 50 + i*3, 2 + (i//2)))
-                data.append((log_date, 'Abstract Art', 'XL', 70 + i*2, 3 + (i//2)))
+                # Abstract Art (Medium volume, growing popularity)
+                data.append((log_date, 'Abstract Art', 'S', 50 + i*3, 2 + (i//3)))
+                data.append((log_date, 'Abstract Art', 'XL', 70 + i*2, 3 + (i//4)))
                 
-                # Design 3: Vintage Stripes (Low volume, high defect rate simulation)
-                data.append((log_date, 'Vintage Stripes', 'M', 30 + i*2, 1 + i))
+                # Vintage Stripes (Lower volume, stable defects)
+                data.append((log_date, 'Vintage Stripes', 'M', 30 + i, 1 + (i//5)))
+                
+                # Holiday Special (Only in the last 15 days, low volume but high price)
+                if i <= 15:
+                    data.append((log_date, 'Holiday Special', 'L', 20 + i*2, 1 + (i//8)))
                 
             # Add a few logs for today
-            data.append((today.strftime('%Y-%m-%d'), 'Logo Tee', 'M', 150, 6))
-            data.append((today.strftime('%Y-%m-%d'), 'Abstract Art', 'L', 80, 4))
+            today_str = today.strftime('%Y-%m-%d')
+            data.append((today_str, 'Logo Tee', 'M', 150, 6))
+            data.append((today_str, 'Abstract Art', 'L', 80, 4))
+            data.append((today_str, 'Holiday Special', 'S', 40, 2))
             
             c.executemany("INSERT INTO PRODUCTION_LOG (log_date, product_name, size, units_produced, defects) VALUES (?, ?, ?, ?, ?)", data)
         
         conn.commit()
     except sqlite3.IntegrityError:
+        # This is expected if the app runs multiple times, user data already exists
         pass 
     except Exception as e:
-        st.error(f"Error initializing data: {e}")
+        st.error(f"Error initializing database: {e}")
     finally:
-        conn.close()
+        conn.close() # Ensure the connection is closed after initialization
 
 
 # --- Authentication Functions ---
@@ -211,8 +217,8 @@ def login_page():
     with col1:
         st.subheader("Existing User Login")
         with st.form("login_form"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
+            username = st.text_input("Username", value="admin") # Pre-fill for ease of use
+            password = st.text_input("Password", type="password", value="adminpass") # Pre-fill for ease of use
             login_submitted = st.form_submit_button("Log In")
 
             if login_submitted:
@@ -259,13 +265,13 @@ def signup_page():
 
 def performance_and_sales_page():
     """Displays improved production performance graphs and revenue metrics."""
-    st.title("📈 Performance and Sales Tracking")
+    st.title("📈 Production Performance and Sales Tracking")
 
     # Use st.session_state.get('db_refresher', 0) to force cache invalidation
     df = get_production_data(st.session_state.get('db_refresher', 0))
     
     if df.empty:
-        st.info("No production data available yet. Please log some production runs to see the graphs.")
+        st.warning("No production data available. Sample data failed to load or has been deleted.")
         return
         
     # --- 1. Top Level Metrics (Revenue and Volume) ---
@@ -274,7 +280,7 @@ def performance_and_sales_page():
     total_defects = df['defects'].sum()
     defect_rate_overall = (total_defects / total_units_produced) * 100 if total_units_produced else 0
     
-    st.subheader("Financial and Volume Overview")
+    st.subheader("Financial and Volume Overview (Last 30 Days)")
     col_rev, col_units, col_def_rate = st.columns(3)
     
     with col_rev:
@@ -284,7 +290,9 @@ def performance_and_sales_page():
         st.metric(label="Total Units Produced", value=f"{total_units_produced:,}")
         
     with col_def_rate:
-        st.metric(label="Overall Defect Rate", value=f"{defect_rate_overall:.2f}%")
+        st.metric(label="Overall Defect Rate", value=f"{defect_rate_overall:.2f}%", 
+                  delta=f"{defect_rate_overall/10:.2f}% vs last month average" if defect_rate_overall > 5 else None,
+                  delta_color="inverse")
         
     st.markdown("---")
 
@@ -299,7 +307,7 @@ def performance_and_sales_page():
     df_daily.loc[df_daily['total_units'] == 0, 'defect_rate'] = 0 
     
     # --- Chart 1: Daily Revenue Trend (Bar Chart) ---
-    st.subheader("Daily Potential Revenue")
+    st.subheader("Daily Potential Revenue Trend")
     
     revenue_chart = alt.Chart(df_daily).mark_bar().encode(
         x=alt.X('log_date:T', axis=alt.Axis(title='Date', format='%Y-%m-%d')),
@@ -312,7 +320,7 @@ def performance_and_sales_page():
         ]
     ).properties(
         title='Daily Revenue from Production Volume'
-    )
+    ).interactive()
     st.altair_chart(revenue_chart, use_container_width=True)
 
     st.markdown("---")
@@ -337,13 +345,15 @@ def performance_and_sales_page():
 
     bars = base.mark_bar().encode(
         y=alt.Y('Count:Q', title='Count'),
-        color=alt.Color('Metric:N', legend=alt.Legend(title="Metric"), scale=alt.Scale(range=['#4c78a8', '#f58518'])),
-        column=alt.Column('Metric:N', header=alt.Header(titleOrient="bottom", labelOrient="bottom")),
+        color=alt.Color('Metric:N', 
+                        legend=alt.Legend(title="Metric"), 
+                        scale=alt.Scale(domain=['total_units', 'total_defects'], range=['#38A169', '#E53E3E'])),
+        column=alt.Column('Metric:N', header=alt.Header(titleOrient="bottom", labelOrient="bottom", title="Units Produced / Defects")),
     ).resolve_scale(
         y='independent' 
     ).properties(
-        title='Daily Production Volume (Units) vs. Defects Recorded' 
-    )
+        title='Volume vs. Defects' 
+    ).interactive()
 
     st.altair_chart(bars, use_container_width=True)
     
@@ -367,18 +377,50 @@ def performance_and_sales_page():
     
     st.altair_chart(rate_chart, use_container_width=True)
 
+    st.markdown("---")
+
+    # --- Chart 4: Product Contribution to Revenue (Pie Chart) ---
+    st.subheader("Revenue Contribution by Design")
+
+    df_product_revenue = df.groupby('product_name').agg(
+        total_revenue=('potential_revenue', 'sum')
+    ).reset_index().sort_values(by='total_revenue', ascending=False)
+
+    pie_chart = alt.Chart(df_product_revenue).mark_arc(outerRadius=120, innerRadius=50).encode(
+        theta=alt.Theta("total_revenue", stack=True),
+        color=alt.Color("product_name", title="T-Shirt Design"),
+        order=alt.Order("total_revenue", sort="descending"),
+        tooltip=[
+            "product_name", 
+            alt.Tooltip("total_revenue", title="Total Revenue", format="$,.2f"),
+            alt.Tooltip("total_revenue", title="Percentage", format=".1%"),
+        ]
+    ).properties(
+        title='Product Revenue Breakdown'
+    ).interactive()
+
+    text = alt.Chart(df_product_revenue).mark_text(radius=140).encode(
+        theta=alt.Theta("total_revenue", stack=True),
+        text=alt.Text("total_revenue", format="$,.0f"),
+        order=alt.Order("total_revenue", sort="descending"),
+        color=alt.value("black")
+    )
+    
+    st.altair_chart(pie_chart + text, use_container_width=True)
+
+
 def dashboard_page():
     """Main dashboard based on user role."""
     st.title(f"Welcome, {st.session_state['username']}! ({st.session_state['role'].capitalize()})")
     
     if st.session_state['role'] == 'admin':
         st.header("Admin Overview")
-        st.info("Use the sidebar navigation to manage products, log production, or view performance.")
+        st.info("You have access to production logs and performance tracking. Use the sidebar menu to navigate.")
         performance_and_sales_page() 
         
     elif st.session_state['role'] == 'customer':
         st.header("Customer Portal")
-        st.write("View our latest designs and place an order request.")
+        st.info("Explore our exclusive T-shirt designs.")
         view_designs_page()
 
 def manage_production_page():
@@ -394,7 +436,7 @@ def manage_production_page():
     st.title("Log New Production Run")
     
     if not designs:
-        st.warning("No designs found. Please add designs first.")
+        st.warning("No designs found. Please add designs first via 'Manage Designs'.")
         return
 
     with st.form("production_log_form"):
@@ -492,7 +534,7 @@ def view_designs_page():
             column_config={
                 "name": st.column_config.TextColumn("Design Name", help="The unique name of the T-Shirt design"),
                 "description": st.column_config.TextColumn("Description", help="Details about the design and print style"),
-                "price_usd": st.column_config.NumberColumn("Unit Price", help="Selling price per unit", format="%.2f", default=19.99)
+                "price_usd": st.column_config.NumberColumn("Unit Price", help="Selling price per unit", format="$%.2f")
             },
             hide_index=True,
             use_container_width=True
@@ -502,8 +544,11 @@ def view_designs_page():
 def logout():
     """Logs the user out and clears session state."""
     st.session_state['authenticated'] = False
-    del st.session_state['username']
-    del st.session_state['role']
+    # Clear specific user session keys but keep app configuration keys
+    if 'username' in st.session_state:
+        del st.session_state['username']
+    if 'role' in st.session_state:
+        del st.session_state['role']
     st.session_state['page'] = 'login'
     st.rerun()
 
@@ -556,7 +601,7 @@ def main_app():
             if st.button("Logout", type="secondary"):
                 logout()
         else:
-            st.info("Please log in or sign up.")
+            st.info("Please log in or sign up. Use **admin**/**adminpass** to view the charts.")
 
     # --- Page Router ---
     if st.session_state['page'] == 'login' or not st.session_state['authenticated']:
