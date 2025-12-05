@@ -8,37 +8,14 @@ from threading import Lock
 import os
 import time
 
+# Set page configuration for a better look
+st.set_page_config(page_title="Code & Thread Shop", layout="centered", initial_sidebar_state="expanded")
+
 # --- Constants and Configuration ---
 DB_NAME = 'tshirt_shop.db'
 PRODUCT_ID = 1  # Fixed ID for the single T-shirt product
 MAX_RETRIES = 5
-RETRY_DELAY_SEC = 1.0 # Increased delay for higher resilience
-
-# --- Database Cleanup (Run before @st.cache_resource) ---
-def clean_locked_db(db_path):
-    """Attempts to remove a locked database file."""
-    if os.path.exists(db_path):
-        try:
-            # Attempt a connection with a very short timeout (microsecond level)
-            # If this fails, the file is likely locked by another process
-            test_conn = sqlite3.connect(db_path, timeout=0.001)
-            test_conn.close()
-            return False # Not locked
-        except sqlite3.OperationalError:
-            # If a lock is detected, try to delete the file
-            try:
-                os.remove(db_path)
-                st.toast("Locked database file successfully removed for fresh start.")
-                return True
-            except Exception as file_error:
-                # If removal fails (e.g., file is actively open), just report the error
-                st.warning(f"Database file '{db_path}' is locked and could not be removed: {file_error}")
-                return False
-        except Exception:
-            return False
-
-# Aggressively try to clean the file at startup before anything else runs
-clean_locked_db(DB_NAME)
+RETRY_DELAY_SEC = 1.0 # Aggressive delay for resilience
 
 # --- Database Management Class (Maximum Resilience) ---
 class DBManager:
@@ -49,67 +26,67 @@ class DBManager:
     def __init__(self, db_path):
         self.db_path = db_path
         self._lock = Lock()
-        self._conn = self._get_connection()
-        self._initialize_db_with_retry() # Use the new retry method
+        # Establish connection first
+        self._conn = self._get_connection() 
+        # Then, initialize the database with retry logic
+        self._initialize_db_with_retry() 
 
     def _get_connection(self):
-        """Creates or returns the connection, ensuring only one connection exists."""
-        # CRITICAL FIX: Set connection timeout to 60 seconds (up from 30) 
-        # to aggressively wait out any startup locks.
+        """Creates the connection with a high timeout."""
+        # CRITICAL FIX: Set connection timeout to 60 seconds 
         conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=60)
-        conn.row_factory = sqlite3.Row # Ensure we can access columns by name
+        conn.row_factory = sqlite3.Row # Allows column access by name
         return conn
 
     def _initialize_db_with_retry(self):
         """
         Retries database initialization if an OperationalError occurs,
-        specifically targeting the race condition during Streamlit startup.
+        targeting race conditions and schema inconsistencies.
         """
         for attempt in range(MAX_RETRIES):
             try:
                 self._initialize_db()
                 return # Success
             except sqlite3.OperationalError as e:
-                if 'database is locked' in str(e) or 'timeout' in str(e):
+                # Catch lock, timeout, and schema issues during initial setup
+                if 'database is locked' in str(e) or 'timeout' in str(e) or 'no such column' in str(e):
                     if attempt < MAX_RETRIES - 1:
-                        st.warning(f"Database locked during initialization. Retrying in {RETRY_DELAY_SEC}s... (Attempt {attempt + 1}/{MAX_RETRIES})")
-                        time.sleep(RETRY_DELAY_SEC)
+                        st.warning(f"Database issue during initialization. Retrying in {RETRY_DELAY_SEC}s... (Attempt {attempt + 1}/{MAX_RETRIES})")
+                        # Wait for the lock/inconsistency to clear
+                        time.sleep(RETRY_DELAY_SEC) 
                     else:
                         st.error("CRITICAL: Failed to initialize database after multiple retries. The application cannot start.")
-                        # This re-raises the error if all attempts fail
                         raise e
                 else:
-                    # Raise other OperationalErrors immediately
                     raise e
             except Exception as e:
-                # Raise other exceptions immediately
                 raise e
 
     def _initialize_db(self):
-        """Creates tables and populates initial data idempotently."""
+        """
+        Creates tables atomically and populates initial data idempotently.
+        All DDL (CREATE TABLE) is done in one script execution for robustness.
+        """
         conn = self._conn
         c = conn.cursor()
         
-        # 1. Define all necessary tables using IF NOT EXISTS
-        c.execute('''
+        # 1. Define all necessary tables using a single executescript for atomic schema setup
+        # This fixes the 'no such column' error by ensuring all tables are fully created before accessing
+        schema_script = f'''
             CREATE TABLE IF NOT EXISTS USERS (
                 username TEXT PRIMARY KEY,
                 password_hash TEXT,
                 role TEXT
-            )
-        ''')
-        
-        c.execute('''
+            );
+            
             CREATE TABLE IF NOT EXISTS PRODUCTS (
                 product_id INTEGER PRIMARY KEY,
                 name TEXT,
                 description TEXT,
                 price REAL,
                 stock INTEGER
-            )
-        ''')
-        
-        c.execute('''
+            );
+            
             CREATE TABLE IF NOT EXISTS ORDERS (
                 order_id TEXT PRIMARY KEY,
                 username TEXT,
@@ -121,10 +98,8 @@ class DBManager:
                 city TEXT,
                 zip_code TEXT,
                 FOREIGN KEY (username) REFERENCES USERS(username)
-            )
-        ''')
+            );
 
-        c.execute('''
             CREATE TABLE IF NOT EXISTS ORDER_ITEMS (
                 item_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 order_id TEXT,
@@ -134,8 +109,9 @@ class DBManager:
                 unit_price REAL,
                 FOREIGN KEY (order_id) REFERENCES ORDERS(order_id),
                 FOREIGN KEY (product_id) REFERENCES PRODUCTS(product_id)
-            )
-        ''')
+            );
+        '''
+        c.executescript(schema_script)
         conn.commit()
 
         # 2. Add initial users (Idempotent check)
@@ -146,7 +122,6 @@ class DBManager:
             conn.commit()
 
         # 3. Add initial product data (Idempotent check)
-        # This is the line that keeps crashing, now protected by the aggressive retry/timeout mechanism.
         c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
         if c.fetchone() is None:
             c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
@@ -186,7 +161,6 @@ class DBManager:
         with self._lock:
             conn = self._conn
             try:
-                # pandas.read_sql_query uses the connection instance safely
                 df = pd.read_sql_query(query, conn, params=params)
                 return df
             except Exception as e:
@@ -196,16 +170,14 @@ class DBManager:
 @st.cache_resource
 def get_db_manager():
     """Initializes and returns the thread-safe DBManager instance."""
-    # The DBManager constructor now handles the retry logic internally.
     return DBManager(DB_NAME)
 
 try:
     # Attempt to get the DB manager instance
     db_manager = get_db_manager()
 except Exception as e:
-    # If initialization fails even after retries, display a critical error
     st.error(f"Critical Error: Database initialization failed. Please try refreshing the app. Error Details: {e}")
-    st.stop() # Stop the script execution
+    st.stop() 
 
 # --- Helper Functions Adapted to DBManager ---
 
@@ -216,12 +188,9 @@ def verify_user(username, password):
     try:
         users = db_manager.fetch_query("SELECT password_hash FROM USERS WHERE username = ?", (username,))
         if users:
-            # users[0] is an sqlite3.Row object, access by name
             return users[0]['password_hash'] == hash_password(password)
         return False
-    except Exception as e:
-        # Suppress for cleaner UI, only log if needed
-        # st.error(f"Error verifying user: {e}") 
+    except Exception:
         return False
 
 def add_user(username, password):
@@ -235,8 +204,7 @@ def add_user(username, password):
     except sqlite3.OperationalError:
         st.warning("Database busy. Please try again.")
         return False
-    except Exception as e:
-        st.error(f"Error adding user: {e}")
+    except Exception:
         return False
 
 def get_product_details(product_id):
@@ -244,11 +212,8 @@ def get_product_details(product_id):
         products = db_manager.fetch_query("SELECT * FROM PRODUCTS WHERE product_id = ?", (product_id,))
         if products:
             row = products[0]
-            # Accessing columns by name using the set row_factory
             return {'product_id': row['product_id'], 'name': row['name'], 'description': row['description'], 'price': row['price'], 'stock': row['stock']}
-    except Exception as e:
-        # Suppress for cleaner UI, only log if needed
-        # st.error(f"Error accessing product details: {e}. Try refreshing.")
+    except Exception:
         return None
     return None
 
@@ -268,7 +233,6 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
 
             # 2. Insert into ORDER_ITEMS and update stock
             for item in cart_items:
-                # Stock check MUST use the correct column name 'stock'
                 c.execute("SELECT stock FROM PRODUCTS WHERE product_id = ?", (item['product_id'],))
                 product_stock = c.fetchone()
                 
@@ -288,7 +252,6 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
             return True, order_id
 
     except sqlite3.OperationalError:
-         # Lock is handled by the DBManager, this usually means a timeout or IO issue
          return False, "Database busy. Please try completing your order again."
     except Exception as e:
          st.error(f"Database error during order placement: {e}")
@@ -476,7 +439,6 @@ def dashboard_page():
     st.subheader(f"Welcome, {st.session_state['username'].capitalize()}")
 
     try:
-        # Fetch order history using the DBManager's thread-safe method
         df_orders = db_manager.fetch_query_df("SELECT order_id, order_date, total_amount, status, full_name, address, city, zip_code FROM ORDERS WHERE username = ? ORDER BY order_date DESC", 
                                       params=(st.session_state['username'],))
     except Exception as e:
@@ -494,12 +456,10 @@ def dashboard_page():
     if st.session_state['username'] == 'admin':
         st.subheader("Admin Panel")
         
-        # Load all orders for admin
         df_all_orders = db_manager.fetch_query_df("SELECT order_id, username, order_date, total_amount, status, full_name, address, city, zip_code FROM ORDERS")
         st.markdown("#### All Orders")
         st.dataframe(df_all_orders, hide_index=True, use_container_width=True)
         
-        # Load products for admin
         df_products = db_manager.fetch_query_df("SELECT product_id, name, price, stock FROM PRODUCTS")
         st.markdown("#### Product Stock")
         st.dataframe(df_products, hide_index=True, use_container_width=True)
@@ -508,8 +468,6 @@ def dashboard_page():
 
 def main_app():
     """The main entry point for the Streamlit application."""
-    
-    # DB Manager is initialized and ready due to @st.cache_resource
 
     # 1. Initialize session state variables
     if 'logged_in' not in st.session_state:
@@ -566,11 +524,8 @@ def main_app():
         login_page()
 
 
-# The execution point of the script
 if __name__ == '__main__':
-    # This try/except block wraps the main app run to handle high-level errors
     try:
         main_app()
     except Exception as e:
-        # Generic catch-all for anything outside of the database logic
         st.error(f"An unexpected application error occurred. Please refresh the page. Error: {e}")
