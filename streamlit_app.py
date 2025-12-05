@@ -14,135 +14,102 @@ st.set_page_config(page_title="Code & Thread Shop", layout="centered", initial_s
 # --- Constants and Configuration ---
 DB_NAME = 'tshirt_shop.db'
 PRODUCT_ID = 1  # Fixed ID for the single T-shirt product
-MAX_RETRIES = 5
-RETRY_DELAY_SEC = 1.0 
-
-# ***************************************************************
-# CRITICAL FIX FOR PERSISTENT SCHEMA CORRUPTION (FINAL ATTEMPT)
-# FORCE DELETE THE DATABASE FILE ON EVERY START TO ENSURE A CLEAN SCHEMA
-# ***************************************************************
-if os.path.exists(DB_NAME):
-    try:
-        os.remove(DB_NAME)
-        # We don't use st.toast here as it might not be available during the very first run
-        # but the file deletion itself should solve the problem.
-    except Exception as e:
-        # If deletion fails, the file is actively locked, but we proceed, relying on the 
-        # 60-second timeout to eventually succeed.
-        pass 
-# ***************************************************************
-
 
 # --- Database Management Class (Maximum Resilience) ---
 class DBManager:
     """
     Manages the SQLite connection and enforces thread safety using a Lock.
-    Includes aggressive retry logic for startup and a 60-second connection timeout.
     """
     def __init__(self, db_path):
         self.db_path = db_path
         self._lock = Lock()
         # Establish connection first
         self._conn = self._get_connection() 
-        # Then, initialize the database with retry logic
-        self._initialize_db_with_retry() 
+        # Initialize the database
+        self._initialize_db() 
 
     def _get_connection(self):
         """Creates the connection with a high timeout."""
-        # CRITICAL FIX: Set connection timeout to 60 seconds 
+        # Set connection timeout to 60 seconds 
         conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=60)
+        # Enable write-ahead logging (WAL) for better concurrency performance
+        # WAL allows multiple readers while one writer is active.
+        conn.execute("PRAGMA journal_mode=WAL") 
         conn.row_factory = sqlite3.Row # Allows column access by name
         return conn
 
-    def _initialize_db_with_retry(self):
-        """
-        Retries database initialization if an OperationalError occurs,
-        targeting race conditions and schema inconsistencies.
-        """
-        for attempt in range(MAX_RETRIES):
-            try:
-                self._initialize_db()
-                return # Success
-            except sqlite3.OperationalError as e:
-                # Catch lock, timeout, and schema issues during initial setup
-                if 'database is locked' in str(e) or 'timeout' in str(e) or 'no such column' in str(e):
-                    if attempt < MAX_RETRIES - 1:
-                        st.warning(f"Database issue during initialization. Retrying in {RETRY_DELAY_SEC}s... (Attempt {attempt + 1}/{MAX_RETRIES})")
-                        # Wait for the lock/inconsistency to clear
-                        time.sleep(RETRY_DELAY_SEC) 
-                    else:
-                        st.error("CRITICAL: Failed to initialize database after multiple retries. The application cannot start.")
-                        raise e
-                else:
-                    raise e
-            except Exception as e:
-                raise e
-
     def _initialize_db(self):
         """
-        Creates tables atomically and populates initial data idempotently.
-        All DDL (CREATE TABLE) is done in one script execution for robustness.
+        Creates tables atomically and populates initial data idempotently,
+        using an explicit transaction (context manager) for robustness.
         """
         conn = self._conn
         c = conn.cursor()
         
-        # 1. Define all necessary tables using a single executescript for atomic schema setup
-        schema_script = f'''
-            CREATE TABLE IF NOT EXISTS USERS (
-                username TEXT PRIMARY KEY,
-                password_hash TEXT,
-                role TEXT
-            );
-            
-            CREATE TABLE IF NOT EXISTS PRODUCTS (
-                product_id INTEGER PRIMARY KEY,
-                name TEXT,
-                description TEXT,
-                price REAL,
-                stock INTEGER
-            );
-            
-            CREATE TABLE IF NOT EXISTS ORDERS (
-                order_id TEXT PRIMARY KEY,
-                username TEXT,
-                order_date TEXT,
-                total_amount REAL,
-                status TEXT,
-                full_name TEXT,
-                address TEXT,
-                city TEXT,
-                zip_code TEXT,
-                FOREIGN KEY (username) REFERENCES USERS(username)
-            );
+        # Use a context manager to ensure transaction integrity (atomic commit/rollback)
+        try:
+            with conn: # This implicitly starts a transaction and commits on success
+                # 1. Define all necessary tables using a single executescript for atomic schema setup
+                schema_script = f'''
+                    CREATE TABLE IF NOT EXISTS USERS (
+                        username TEXT PRIMARY KEY,
+                        password_hash TEXT,
+                        role TEXT
+                    );
+                    
+                    CREATE TABLE IF NOT EXISTS PRODUCTS (
+                        product_id INTEGER PRIMARY KEY,
+                        name TEXT,
+                        description TEXT,
+                        price REAL,
+                        stock INTEGER
+                    );
+                    
+                    CREATE TABLE IF NOT EXISTS ORDERS (
+                        order_id TEXT PRIMARY KEY,
+                        username TEXT,
+                        order_date TEXT,
+                        total_amount REAL,
+                        status TEXT,
+                        full_name TEXT,
+                        address TEXT,
+                        city TEXT,
+                        zip_code TEXT,
+                        FOREIGN KEY (username) REFERENCES USERS(username)
+                    );
 
-            CREATE TABLE IF NOT EXISTS ORDER_ITEMS (
-                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id TEXT,
-                product_id INTEGER,
-                size TEXT,
-                quantity INTEGER,
-                unit_price REAL,
-                FOREIGN KEY (order_id) REFERENCES ORDERS(order_id),
-                FOREIGN KEY (product_id) REFERENCES PRODUCTS(product_id)
-            );
-        '''
-        c.executescript(schema_script)
-        conn.commit()
+                    CREATE TABLE IF NOT EXISTS ORDER_ITEMS (
+                        item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        order_id TEXT,
+                        product_id INTEGER,
+                        size TEXT,
+                        quantity INTEGER,
+                        unit_price REAL,
+                        FOREIGN KEY (order_id) REFERENCES ORDERS(order_id),
+                        FOREIGN KEY (product_id) REFERENCES PRODUCTS(product_id)
+                    );
+                '''
+                c.executescript(schema_script)
 
-        # 2. Add initial users (Idempotent check)
-        c.execute("SELECT COUNT(*) FROM USERS WHERE username = 'admin'")
-        if c.fetchone()[0] == 0:
-            c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
-            c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
-            conn.commit()
+                # 2. Add initial users (Idempotent check)
+                c.execute("SELECT COUNT(*) FROM USERS WHERE username = 'admin'")
+                if c.fetchone()[0] == 0:
+                    c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
+                    c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
 
-        # 3. Add initial product data (Idempotent check)
-        # This check is now guaranteed to succeed because the schema was just created atomically
-        c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
-        if c.fetchone() is None:
-            c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
-                      (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
-            conn.commit()
+                # 3. Add initial product data (Idempotent check)
+                # This check is now guaranteed to succeed because the schema was just created atomically
+                c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
+                if c.fetchone() is None:
+                    c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
+                            (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
+
+                # Transaction automatically commits here if no exceptions occurred
+
+        except Exception as e:
+            # If any error occurs, the context manager automatically rolls back
+            raise e
+
 
     def execute_query(self, query, params=(), commit=False):
         """Executes a non-SELECT query with thread lock protection."""
@@ -150,15 +117,16 @@ class DBManager:
             conn = self._conn
             c = conn.cursor()
             try:
-                c.execute(query, params)
+                # Use context manager for explicit transaction boundary if committing
                 if commit:
-                    conn.commit()
+                    with conn:
+                        c.execute(query, params)
+                else:
+                    c.execute(query, params)
                 return c
             except sqlite3.OperationalError as e:
-                conn.rollback()
                 raise e
             except Exception as e:
-                conn.rollback()
                 raise e
 
     def fetch_query(self, query, params=()):
@@ -177,6 +145,7 @@ class DBManager:
         with self._lock:
             conn = self._conn
             try:
+                # pandas read_sql_query automatically uses the connection as a transaction
                 df = pd.read_sql_query(query, conn, params=params)
                 return df
             except Exception as e:
@@ -185,15 +154,39 @@ class DBManager:
 # --- Global Database Manager Instance ---
 @st.cache_resource
 def get_db_manager():
-    """Initializes and returns the thread-safe DBManager instance."""
-    # The DBManager constructor now handles the retry logic internally.
-    return DBManager(DB_NAME)
+    """
+    Initializes and returns the thread-safe DBManager instance.
+    The file is deleted here to ensure a clean start inside the cache scope.
+    """
+    # CRITICAL FIX: FORCE DELETE THE DATABASE FILE HERE, INSIDE THE CACHE RESOURCE FUNCTION
+    if os.path.exists(DB_NAME):
+        try:
+            # Attempt to delete the database file before connecting
+            os.remove(DB_NAME)
+            # Also attempt to delete WAL files if they exist (important for WAL mode)
+            if os.path.exists(DB_NAME + '-wal'):
+                os.remove(DB_NAME + '-wal')
+            if os.path.exists(DB_NAME + '-shm'):
+                os.remove(DB_NAME + '-shm')
+        except Exception:
+            # If deletion fails (file is locked), we proceed anyway and rely on 
+            # the high timeout (60s) to eventually acquire the lock.
+            pass 
+
+    try:
+        # Initialize and return the thread-safe DBManager instance.
+        return DBManager(DB_NAME)
+    except Exception as e:
+        # If initialization still fails, log the error and propagate
+        st.error(f"Failed to initialize database after attempting file reset. Error: {e}")
+        raise e
 
 try:
     # Attempt to get the DB manager instance
     db_manager = get_db_manager()
 except Exception as e:
-    st.error(f"Critical Error: Database initialization failed. Please try refreshing the app. Error Details: {e}")
+    # If the exception propagated, stop the app execution
+    st.error("CRITICAL: Application halted due to database failure. Please refresh.")
     st.stop() 
 
 # --- Helper Functions Adapted to DBManager ---
@@ -205,6 +198,7 @@ def verify_user(username, password):
     try:
         users = db_manager.fetch_query("SELECT password_hash FROM USERS WHERE username = ?", (username,))
         if users:
+            # We explicitly check for None/empty list first, then access the Row object's column
             return users[0]['password_hash'] == hash_password(password)
         return False
     except Exception:
@@ -212,6 +206,7 @@ def verify_user(username, password):
 
 def add_user(username, password):
     try:
+        # The execute_query handles the transaction logic internally
         db_manager.execute_query("INSERT INTO USERS VALUES (?, ?, ?)", 
                                  (username, hash_password(password), 'customer'), 
                                  commit=True)
@@ -244,33 +239,38 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
             conn = db_manager._conn
             c = conn.cursor()
             
-            # 1. Insert into ORDERS table 
-            c.execute("INSERT INTO ORDERS (order_id, username, order_date, total_amount, status, full_name, address, city, zip_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (order_id, username, order_date, total_amount, 'Processing', full_name, address, city, zip_code))
+            # Use conn context manager for automatic transaction control
+            with conn: 
+                # 1. Insert into ORDERS table 
+                c.execute("INSERT INTO ORDERS (order_id, username, order_date, total_amount, status, full_name, address, city, zip_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (order_id, username, order_date, total_amount, 'Processing', full_name, address, city, zip_code))
 
-            # 2. Insert into ORDER_ITEMS and update stock
-            for item in cart_items:
-                c.execute("SELECT stock FROM PRODUCTS WHERE product_id = ?", (item['product_id'],))
-                product_stock = c.fetchone()
-                
-                if product_stock and product_stock[0] >= item['quantity']:
-                    # Insert item
-                    c.execute("INSERT INTO ORDER_ITEMS (order_id, product_id, size, quantity, unit_price) VALUES (?, ?, ?, ?, ?)",
-                            (order_id, item['product_id'], item['size'], item['quantity'], item['price']))
+                # 2. Insert into ORDER_ITEMS and update stock
+                for item in cart_items:
+                    c.execute("SELECT stock FROM PRODUCTS WHERE product_id = ?", (item['product_id'],))
+                    product_stock = c.fetchone()
+                    
+                    if product_stock and product_stock[0] >= item['quantity']:
+                        # Insert item
+                        c.execute("INSERT INTO ORDER_ITEMS (order_id, product_id, size, quantity, unit_price) VALUES (?, ?, ?, ?, ?)",
+                                (order_id, item['product_id'], item['size'], item['quantity'], item['price']))
 
-                    # Update stock
-                    new_stock = product_stock[0] - item['quantity']
-                    c.execute("UPDATE PRODUCTS SET stock = ? WHERE product_id = ?", (new_stock, item['product_id']))
-                else:
-                    conn.rollback() 
-                    return False, f"Error: Insufficient stock for product ID {item['product_id']} (Requested: {item['quantity']}, Available: {product_stock[0] if product_stock else 0})"
+                        # Update stock
+                        new_stock = product_stock[0] - item['quantity']
+                        c.execute("UPDATE PRODUCTS SET stock = ? WHERE product_id = ?", (new_stock, item['product_id']))
+                    else:
+                        # Rerollback is handled by 'with conn:' if an exception is raised
+                        raise Exception(f"Insufficient stock for product ID {item['product_id']}")
 
-            conn.commit()
+            # Transaction committed automatically if the 'with conn:' block completes
             return True, order_id
 
     except sqlite3.OperationalError:
          return False, "Database busy. Please try completing your order again."
     except Exception as e:
+         # Check if the error came from the stock check
+         if "Insufficient stock" in str(e):
+             return False, f"Order failed: {str(e)}"
          st.error(f"Database error during order placement: {e}")
          return False, f"Order failed due to an internal error: {e}"
 
@@ -319,6 +319,7 @@ def login_page():
 def product_page():
     st.title("T-Shirt Store")
 
+    # Fetch product details
     product = get_product_details(PRODUCT_ID)
     if not product:
         st.error("Product details are currently unavailable. The database may still be initializing. Please refresh.")
@@ -345,6 +346,7 @@ def product_page():
     with col_qty:
         existing_item = next((item for item in st.session_state['cart'] if item['product_id'] == PRODUCT_ID and item['size'] == size), None)
         default_qty = existing_item['quantity'] if existing_item else 1
+        # Max quantity is the current stock
         quantity = st.number_input("Quantity", min_value=1, max_value=product['stock'], value=default_qty, step=1, key="select_quantity")
     
     with col_add:
@@ -456,6 +458,7 @@ def dashboard_page():
     st.subheader(f"Welcome, {st.session_state['username'].capitalize()}")
 
     try:
+        # Fetch orders for the current user
         df_orders = db_manager.fetch_query_df("SELECT order_id, order_date, total_amount, status, full_name, address, city, zip_code FROM ORDERS WHERE username = ? ORDER BY order_date DESC", 
                                       params=(st.session_state['username'],))
     except Exception as e:
@@ -473,10 +476,12 @@ def dashboard_page():
     if st.session_state['username'] == 'admin':
         st.subheader("Admin Panel")
         
-        df_all_orders = db_manager.fetch_query_df("SELECT order_id, username, order_date, total_amount, status, full_name, address, city, zip_code FROM ORDERS")
+        # Fetch all orders for admin
+        df_all_orders = db_manager.fetch_query_df("SELECT order_id, username, order_date, total_amount, status, full_name, address, city, zip_code FROM ORDERS ORDER BY order_date DESC")
         st.markdown("#### All Orders")
         st.dataframe(df_all_orders, hide_index=True, use_container_width=True)
         
+        # Fetch product stock for admin
         df_products = db_manager.fetch_query_df("SELECT product_id, name, price, stock FROM PRODUCTS")
         st.markdown("#### Product Stock")
         st.dataframe(df_products, hide_index=True, use_container_width=True)
@@ -543,6 +548,8 @@ def main_app():
 
 if __name__ == '__main__':
     try:
+        # The main logic is now inside main_app
         main_app()
     except Exception as e:
+        # Catch unexpected errors in the main loop
         st.error(f"An unexpected application error occurred. Please refresh the page. Error: {e}")
