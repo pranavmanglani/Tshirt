@@ -25,8 +25,7 @@ class DBManager:
         self._lock = Lock()
         # Establish connection first
         self._conn = self._get_connection() 
-        # Initialize the database
-        self._initialize_db() 
+        # The database is assumed to be fully initialized at this point by get_db_manager
 
     def _get_connection(self):
         """Creates the connection with a high timeout."""
@@ -38,26 +37,39 @@ class DBManager:
         conn.row_factory = sqlite3.Row # Allows column access by name
         return conn
 
-    def _initialize_db(self):
+    # --- Static Initialization Method ---
+    @staticmethod
+    def _initialize_db_safely(target_db_path):
         """
-        Creates tables atomically and populates initial data idempotently,
-        using an explicit transaction (context manager) for robustness.
+        Creates the database in a temporary location, initializes tables atomically, 
+        and then moves it to the final location (target_db_path).
+        This guarantees atomicity and avoids race conditions during schema creation.
         """
-        conn = self._conn
-        c = conn.cursor()
+        # Use a temporary, unique file name for creation
+        db_temp_name = f'tshirt_shop_temp_{uuid.uuid4()}.db'
         
-        # Use a context manager to ensure transaction integrity (atomic commit/rollback)
+        # 1. Clean up potential old temp files just in case
+        if os.path.exists(db_temp_name):
+            os.remove(db_temp_name)
+
+        conn = None
         try:
-            with conn: # This implicitly starts a transaction and commits on success
-                # 1. Define all necessary tables using a single executescript for atomic schema setup
+            # Connect to the temporary file
+            conn = sqlite3.connect(db_temp_name, check_same_thread=False, timeout=60)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            
+            # Use a context manager to ensure transaction integrity (atomic commit/rollback)
+            with conn: 
+                # Define all necessary tables using a single executescript for atomic schema setup
                 schema_script = f'''
-                    CREATE TABLE IF NOT EXISTS USERS (
+                    CREATE TABLE USERS (
                         username TEXT PRIMARY KEY,
                         password_hash TEXT,
                         role TEXT
                     );
                     
-                    CREATE TABLE IF NOT EXISTS PRODUCTS (
+                    CREATE TABLE PRODUCTS (
                         product_id INTEGER PRIMARY KEY,
                         name TEXT,
                         description TEXT,
@@ -65,7 +77,7 @@ class DBManager:
                         stock INTEGER
                     );
                     
-                    CREATE TABLE IF NOT EXISTS ORDERS (
+                    CREATE TABLE ORDERS (
                         order_id TEXT PRIMARY KEY,
                         username TEXT,
                         order_date TEXT,
@@ -78,7 +90,7 @@ class DBManager:
                         FOREIGN KEY (username) REFERENCES USERS(username)
                     );
 
-                    CREATE TABLE IF NOT EXISTS ORDER_ITEMS (
+                    CREATE TABLE ORDER_ITEMS (
                         item_id INTEGER PRIMARY KEY AUTOINCREMENT,
                         order_id TEXT,
                         product_id INTEGER,
@@ -91,24 +103,41 @@ class DBManager:
                 '''
                 c.executescript(schema_script)
 
-                # 2. Add initial users (Idempotent check)
-                c.execute("SELECT COUNT(*) FROM USERS WHERE username = 'admin'")
-                if c.fetchone()[0] == 0:
-                    c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
-                    c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
+                # Add initial users
+                c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
+                c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
 
-                # 3. Add initial product data (Idempotent check)
-                # This check is now guaranteed to succeed because the schema was just created atomically
-                c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
-                if c.fetchone() is None:
-                    c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
-                            (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
+                # Add initial product data
+                c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
+                        (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
 
-                # Transaction automatically commits here if no exceptions occurred
+            # Close the connection to the temporary file
+            conn.close()
+            conn = None 
 
+            # 2. ATOMIC SWAP: Delete the old DB_NAME file and rename the temporary file
+            # This is the crucial step to prevent corruption/locking.
+            if os.path.exists(target_db_path):
+                os.remove(target_db_path)
+            # Remove WAL files if they exist
+            for ext in ['.db-wal', '.db-shm']:
+                wal_file = target_db_path + ext
+                if os.path.exists(wal_file):
+                    os.remove(wal_file)
+                    
+            os.rename(db_temp_name, target_db_path)
+            
         except Exception as e:
-            # If any error occurs, the context manager automatically rolls back
+            # Clean up the temporary file if an error occurred before the swap
+            if os.path.exists(db_temp_name):
+                os.remove(db_temp_name)
             raise e
+        finally:
+            if conn:
+                conn.close()
+            # Final cleanup of the temp file just in case the rename failed partially
+            if os.path.exists(db_temp_name):
+                os.remove(db_temp_name)
 
 
     def execute_query(self, query, params=(), commit=False):
@@ -125,6 +154,7 @@ class DBManager:
                     c.execute(query, params)
                 return c
             except sqlite3.OperationalError as e:
+                # This catches the 'database is locked' error if it somehow persists
                 raise e
             except Exception as e:
                 raise e
@@ -155,38 +185,32 @@ class DBManager:
 @st.cache_resource
 def get_db_manager():
     """
-    Initializes and returns the thread-safe DBManager instance.
-    The file is deleted here to ensure a clean start inside the cache scope.
+    Initializes and returns the thread-safe DBManager instance using the atomic file swap method.
     """
-    # CRITICAL FIX: FORCE DELETE THE DATABASE FILE HERE, INSIDE THE CACHE RESOURCE FUNCTION
-    if os.path.exists(DB_NAME):
+    if not os.path.exists(DB_NAME):
+        # Only perform the expensive, critical initialization/swap if the file doesn't exist
         try:
-            # Attempt to delete the database file before connecting
-            os.remove(DB_NAME)
-            # Also attempt to delete WAL files if they exist (important for WAL mode)
-            if os.path.exists(DB_NAME + '-wal'):
-                os.remove(DB_NAME + '-wal')
-            if os.path.exists(DB_NAME + '-shm'):
-                os.remove(DB_NAME + '-shm')
-        except Exception:
-            # If deletion fails (file is locked), we proceed anyway and rely on 
-            # the high timeout (60s) to eventually acquire the lock.
-            pass 
+            DBManager._initialize_db_safely(DB_NAME)
+        except Exception as e:
+            st.error(f"CRITICAL: Atomic database initialization failed. Error: {e}")
+            raise e
 
     try:
-        # Initialize and return the thread-safe DBManager instance.
+        # Now, the DB_NAME file is guaranteed to exist and have a complete schema.
+        # Initialize and return the thread-safe DBManager instance using the final file.
         return DBManager(DB_NAME)
     except Exception as e:
         # If initialization still fails, log the error and propagate
-        st.error(f"Failed to initialize database after attempting file reset. Error: {e}")
+        st.error(f"Failed to connect to the initialized database. Error: {e}")
         raise e
 
+# --- Global Access to DB Manager ---
 try:
     # Attempt to get the DB manager instance
     db_manager = get_db_manager()
 except Exception as e:
     # If the exception propagated, stop the app execution
-    st.error("CRITICAL: Application halted due to database failure. Please refresh.")
+    st.error("CRITICAL: Application halted due to database failure. Please refresh and try again.")
     st.stop() 
 
 # --- Helper Functions Adapted to DBManager ---
@@ -202,6 +226,7 @@ def verify_user(username, password):
             return users[0]['password_hash'] == hash_password(password)
         return False
     except Exception:
+        # Fail silently on DB error during login attempt
         return False
 
 def add_user(username, password):
@@ -212,7 +237,7 @@ def add_user(username, password):
                                  commit=True)
         return True
     except sqlite3.IntegrityError:
-        return False
+        return False # Username exists
     except sqlite3.OperationalError:
         st.warning("Database busy. Please try again.")
         return False
@@ -224,6 +249,7 @@ def get_product_details(product_id):
         products = db_manager.fetch_query("SELECT * FROM PRODUCTS WHERE product_id = ?", (product_id,))
         if products:
             row = products[0]
+            # Access columns by name, which is enabled by row_factory = sqlite3.Row
             return {'product_id': row['product_id'], 'name': row['name'], 'description': row['description'], 'price': row['price'], 'stock': row['stock']}
     except Exception:
         return None
@@ -259,7 +285,7 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
                         new_stock = product_stock[0] - item['quantity']
                         c.execute("UPDATE PRODUCTS SET stock = ? WHERE product_id = ?", (new_stock, item['product_id']))
                     else:
-                        # Rerollback is handled by 'with conn:' if an exception is raised
+                        # Rollback is handled by 'with conn:' if an exception is raised
                         raise Exception(f"Insufficient stock for product ID {item['product_id']}")
 
             # Transaction committed automatically if the 'with conn:' block completes
@@ -344,15 +370,23 @@ def product_page():
         size = st.selectbox("Size", ['S', 'M', 'L', 'XL'], index=1, key="select_size")
     
     with col_qty:
+        # Calculate max quantity based on current stock
+        max_qty = product['stock'] 
+        
+        # Check if item is already in cart to set default quantity
         existing_item = next((item for item in st.session_state['cart'] if item['product_id'] == PRODUCT_ID and item['size'] == size), None)
         default_qty = existing_item['quantity'] if existing_item else 1
-        # Max quantity is the current stock
-        quantity = st.number_input("Quantity", min_value=1, max_value=product['stock'], value=default_qty, step=1, key="select_quantity")
+        
+        # Ensure default_qty doesn't exceed max_qty
+        if default_qty > max_qty:
+            default_qty = max_qty
+            
+        quantity = st.number_input("Quantity", min_value=1, max_value=max_qty, value=default_qty, step=1, key="select_quantity")
     
     with col_add:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("Add to Cart"):
-            if quantity > 0 and quantity <= product['stock']:
+            if quantity > 0 and quantity <= max_qty:
                 new_item = {
                     'product_id': PRODUCT_ID,
                     'name': product['name'],
