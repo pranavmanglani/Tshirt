@@ -21,7 +21,7 @@ def hash_password(password):
 def initialize_database(target_db_path):
     """
     Creates the database file and initializes all schema tables and initial data,
-    including sample sales data for analytics.
+    including sample sales and defect data for analytics.
     """
     conn = None
     try:
@@ -88,6 +88,16 @@ def initialize_database(target_db_path):
                     value REAL,
                     is_active INTEGER
                 );
+                
+                -- NEW TABLE FOR DEFECTS AND RETURNS ANALYSIS
+                CREATE TABLE DEFECTS (
+                    defect_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    product_id INTEGER,
+                    defect_date TEXT,
+                    quantity INTEGER,
+                    reason TEXT, -- e.g., 'Misprint', 'Tear/Damage', 'Wrong Size', 'Customer Return'
+                    FOREIGN KEY (product_id) REFERENCES PRODUCTS(product_id)
+                );
             '''
             c.executescript(schema_script)
 
@@ -116,7 +126,6 @@ def initialize_database(target_db_path):
             
             # --- Sample Order Data for Analytics (Q1 2024) ---
             
-            # Note: total_amount = total_cost + total_profit
             sample_orders = [
                 # Order 1 (Jan 1, 2024): 1x Tee ($25.00)
                 ('ORD-20240101-001', 'customer1@email.com', '2024-01-01T10:00:00', 25.00, 10.00, 15.00, 'Shipped', 'John Doe', '123 Main St', 'CityA', '10001'),
@@ -151,6 +160,21 @@ def initialize_database(target_db_path):
             ]
             # Note: item_id is AUTOINCREMENT, so we only list 6 parameters here
             c.executemany("INSERT INTO ORDER_ITEMS (order_id, product_id, size, quantity, unit_price, unit_cost) VALUES (?, ?, ?, ?, ?, ?)", sample_items)
+            
+            # --- Sample Defect Data (Q1 2024) ---
+            sample_defects = [
+                # ID 1: Vintage Coding Tee (ID 1) is prone to misprints/size issues
+                (1, '2024-01-10', 2, 'Misprint'), 
+                (1, '2024-02-05', 1, 'Wrong Size'),
+                (1, '2024-03-20', 1, 'Tear/Damage'), 
+                # ID 2: Python Logo Hoodie (ID 2)
+                (2, '2024-01-20', 1, 'Tear/Damage'), 
+                # ID 3: JavaScript Mug (ID 3) - bulk return 
+                (3, '2024-03-01', 5, 'Customer Return (Not as expected)'), 
+                # ID 4: SQL Query Cap (ID 4)
+                (4, '2024-03-15', 1, 'Misprint'), 
+            ]
+            c.executemany("INSERT INTO DEFECTS (product_id, defect_date, quantity, reason) VALUES (?, ?, ?, ?)", sample_defects)
             
 
     except Exception as e:
@@ -215,7 +239,6 @@ class DBManager:
                 raise e
 
 # --- Global Database Manager Instance (Protected Cache) ---
-# FIX: Removed the invalid 'suppress_st_warning=True' argument
 @st.cache_resource
 def get_db_manager():
     # FORCE DATABASE RECREATION to ensure sample data is always present
@@ -459,7 +482,7 @@ def shop_page():
         selected_category = st.selectbox("Filter by Category", categories, key="category_filter")
 
     with col_size:
-        sizes = ['All', 'S', 'M', 'L', 'XL']
+        sizes = ['All', 'S', 'M', 'L', 'XL', 'N/A']
         selected_size = st.selectbox("Filter by Size", sizes, key="size_filter")
         # NOTE: Size filter is purely a label for the user since product table doesn't track stock per size.
 
@@ -894,7 +917,7 @@ def admin_analytics():
     df_items = db_manager.fetch_query_df(query)
     
     if not df_items.empty:
-        st.markdown("#### Product Quantity Breakdown")
+        st.markdown("#### Product Quantity Breakdown (Units Sold)")
         product_sales_qty = df_items.groupby('name')['quantity'].sum().reset_index()
         product_sales_qty.rename(columns={'name': 'Product Name', 'quantity': 'Total Quantity Sold'}, inplace=True)
         
@@ -911,6 +934,85 @@ def admin_analytics():
     st.markdown("---")
     st.markdown("##### Raw Order Data")
     st.dataframe(df_orders[['order_id', 'order_date_dt', 'email', 'total_amount', 'total_cost', 'total_profit', 'status']], hide_index=True, use_container_width=True)
+
+
+def admin_defects_analysis():
+    """Analyzes product defects, returns, and quality control metrics."""
+    st.markdown("### ⚠️ Quality Control & Defect Analysis (Admin Only)")
+    
+    df_defects = db_manager.fetch_query_df(
+        "SELECT D.defect_date, D.quantity, D.reason, P.name FROM DEFECTS D JOIN PRODUCTS P ON D.product_id = P.product_id"
+    )
+
+    if df_defects.empty:
+        st.info("No defects or returns recorded yet.")
+        return
+
+    total_defects = df_defects['quantity'].sum()
+    st.markdown("#### Defect KPIs")
+    
+    col_total_defects, col_avg_qty, col_most_common = st.columns(3)
+    
+    with col_total_defects:
+        st.metric("Total Defective/Returned Units", f"{total_defects:,}", delta_color="inverse")
+    with col_avg_qty:
+        avg_defect_qty = df_defects['quantity'].mean()
+        st.metric("Avg. Items per Defect Record", f"{avg_defect_qty:.2f}")
+    with col_most_common:
+        most_common_reason = df_defects['reason'].mode().iloc[0] if not df_defects['reason'].empty else "N/A"
+        st.metric("Most Common Reason", most_common_reason)
+        
+    st.markdown("---")
+
+    # --- Defect Trend Over Time (Line Chart) ---
+    df_defects['defect_date_dt'] = pd.to_datetime(df_defects['defect_date']).dt.date
+    defects_daily = df_defects.groupby('defect_date_dt')['quantity'].sum().reset_index()
+    defects_daily.rename(columns={'defect_date_dt': 'Date', 'quantity': 'Daily Defect Count'}, inplace=True)
+    
+    st.markdown("#### Defective Units Trend Over Time")
+    st.line_chart(defects_daily, x='Date', y='Daily Defect Count', color="#E53935")
+
+
+    # --- Defect Reason Breakdown (Bar Chart) ---
+    st.markdown("#### Breakdown by Reason")
+    reason_counts = df_defects.groupby('reason')['quantity'].sum().reset_index()
+    reason_counts.rename(columns={'quantity': 'Units Affected'}, inplace=True)
+    st.bar_chart(reason_counts, x='reason', y='Units Affected')
+
+    # --- Defect Rate per Product (Table/Bar Chart) ---
+    st.markdown("#### Defect Rate Per Product")
+
+    # 1. Total Sales Quantity per Product
+    df_sales_qty = db_manager.fetch_query_df(
+        "SELECT product_id, SUM(quantity) as total_sold FROM ORDER_ITEMS GROUP BY product_id"
+    )
+    
+    # 2. Total Defect Quantity per Product
+    df_defect_qty = df_defects.groupby(['product_id', 'name'])['quantity'].sum().reset_index()
+    df_defect_qty.rename(columns={'quantity': 'total_defective'}, inplace=True)
+
+    # 3. Merge and Calculate Rate
+    if not df_sales_qty.empty and not df_defect_qty.empty:
+        df_rate = pd.merge(df_defect_qty, df_sales_qty, on='product_id', how='left').fillna(0)
+        df_rate['total_sold'] = df_rate['total_sold'].astype(int)
+        
+        # Calculate Defect Rate
+        df_rate['defect_rate'] = (df_rate['total_defective'] / df_rate['total_sold']) * 100
+        df_rate.loc[df_rate['total_sold'] == 0, 'defect_rate'] = 0 # Handle division by zero if sold is 0
+        
+        df_rate.rename(columns={'name': 'Product Name', 'total_defective': 'Units Defective', 'total_sold': 'Units Sold'}, inplace=True)
+        
+        df_rate_display = df_rate[['Product Name', 'Units Sold', 'Units Defective', 'defect_rate']].copy()
+        df_rate_display['Defect Rate (%)'] = df_rate_display['defect_rate'].apply(lambda x: f"{x:.2f}%")
+
+        st.dataframe(df_rate_display.drop(columns=['defect_rate']), hide_index=True, use_container_width=True)
+        st.caption("Defect Rate is calculated as (Units Defective / Units Sold) * 100. Higher rates indicate quality issues.")
+    else:
+        st.info("Not enough sales or defect data to calculate defect rates.")
+    
+    st.markdown("---")
+    st.markdown("##### Raw Defect/Return Data")
+    st.dataframe(df_defects[['defect_date', 'name', 'quantity', 'reason']], hide_index=True, use_container_width=True)
 
 
 def user_profile_management():
@@ -993,10 +1095,13 @@ def dashboard_page():
     if user_details['role'] == 'admin':
         with tab_admin:
             st.markdown("## Global Admin Control")
-            admin_tabs = st.tabs(["📊 Analytics", "📦 Inventory & Pricing"])
+            # NEW: Added Defects Analysis Tab
+            admin_tabs = st.tabs(["📊 Sales Analytics", "⚠️ Defects Analysis", "📦 Inventory & Pricing"])
             with admin_tabs[0]:
                 admin_analytics()
             with admin_tabs[1]:
+                admin_defects_analysis()
+            with admin_tabs[2]:
                 admin_product_management()
 
 def order_complete_page():
