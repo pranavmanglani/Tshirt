@@ -130,11 +130,11 @@ def init_db():
                 for i in range(1, 31):
                     log_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
                     
-                    # Mass production tends to be higher volume
+                    # Mass production tends to be higher volume (Wholesale Catalog)
                     data.append((log_date, 'Logo Tee', 'M', 100 + i*2, 5 + (i//5), production_types[0]))
                     data.append((log_date, 'Vintage Stripes', 'S', 50 + i*3, 2 + (i//3), production_types[0]))
                     
-                    # Retail production for higher-priced items
+                    # Retail production for higher-priced items (Retail Collection)
                     data.append((log_date, 'Abstract Art', 'L', 30 + i, 1 + (i//5), production_types[1]))
                     if i <= 15:
                         data.append((log_date, 'Holiday Special', 'XL', 20 + i*2, 1 + (i//8), production_types[1]))
@@ -375,7 +375,7 @@ def performance_and_sales_page():
     mass_data = df_type_summary[df_type_summary['production_type'] == 'Mass'].iloc[0] if 'Mass' in df_type_summary['production_type'].values else None
     
     with col_mass:
-        st.subheader("Mass Production")
+        st.subheader("Mass Production (Wholesale Channel)")
         if mass_data is not None:
             st.metric("Units Produced", f"{mass_data['total_units']:,}")
             st.metric("Potential Revenue", f"${mass_data['total_revenue']:,.2f}")
@@ -544,8 +544,8 @@ def dashboard_page():
         
     elif st.session_state['role'] == 'customer':
         st.header("Customer Portal")
-        st.info("Explore our exclusive T-shirt designs from the retail channel.")
-        view_designs_page()
+        st.info("Choose a collection below: Retail for premium items, Wholesale for bulk orders.")
+        view_product_collections() # Redirect to the new combined view
 
 def manage_production_page():
     """Allows admins to log new production runs."""
@@ -565,7 +565,7 @@ def manage_production_page():
 
     with st.form("production_log_form"):
         # Select the Production Type (Mass or Retail)
-        prod_type = st.selectbox("Production Channel", ['Mass', 'Retail'], help="Select the sales channel this batch is intended for.")
+        prod_type = st.selectbox("Production Channel", ['Mass', 'Retail'], help="Select the sales channel this batch is intended for. Mass for Wholesale, Retail for direct customers.")
         
         prod_date = st.date_input("Date of Production", datetime.now().date())
         prod_name = st.selectbox("Product Design", designs)
@@ -619,7 +619,7 @@ def manage_designs_page():
             description = st.area_input("Description (e.g., color, material, quality notes)")
             
             # NEW INPUT: Design channel/status
-            retail_status = st.selectbox("Primary Sales Channel", ['Mass', 'Retail'], help="Mass production is high volume, retail is often specialized or premium.")
+            retail_status = st.selectbox("Primary Sales Channel", ['Mass', 'Retail'], help="Mass production is high volume (Wholesale), retail is often specialized or premium (Direct Customer).")
             
             price_usd = st.number_input("Unit Price (USD)", min_value=0.01, step=0.01, format="%.2f", value=19.99)
             
@@ -648,8 +648,8 @@ def manage_designs_page():
                 else:
                     st.error("Design Name cannot be empty.")
 
-def view_designs_page():
-    """Displays designs relevant to the customer (Retail items)."""
+def view_product_collections():
+    """Displays separate Retail and Wholesale views for the customer."""
     # Use the cached function to fetch design data
     df_designs = get_designs_data(st.session_state.get('db_refresher', 0))
 
@@ -673,34 +673,67 @@ def view_designs_page():
         )
         return
 
-    # --- Customer View (Retail Focus) ---
-    st.title("🛍️ Retail Channel T-Shirt Collection")
-    st.markdown("Discover our exclusive and premium designs.")
+    # --- Customer View (Combined Retail and Wholesale) ---
+    st.title("👕 Product Collections")
     
-    # Filter for 'Retail' status only
-    df_retail = df_designs[df_designs['retail_status'] == 'Retail']
+    # Filter data
+    df_retail = df_designs[df_designs['retail_status'] == 'Retail'].reset_index(drop=True)
+    df_wholesale = df_designs[df_designs['retail_status'] == 'Mass'].reset_index(drop=True)
 
-    if df_retail.empty:
-        st.info("The Retail Collection is currently empty. Check back soon for new exclusive designs!")
-    else:
-        # Display designs in a grid format
-        cols = st.columns(3)
+    # Use tabs to separate the two channels
+    tab1, tab2 = st.tabs(["🛍️ Retail Collection", "📦 Wholesale Catalog"])
+
+    with tab1:
+        st.subheader("Premium & Exclusive Designs")
+        st.markdown("Browse our unique, limited-edition designs for individual purchase.")
         
-        for index, row in df_retail.iterrows():
-            with cols[index % 3]: # Cycle through columns
-                # Card-like layout for each retail item
-                st.markdown(f"""
-                <div style="border: 2px solid #D6BCFA; border-radius: 10px; padding: 15px; margin-bottom: 20px; text-align: center; background-color: #F8F4FF;">
-                    <h4 style="color: #6B46C1;">{row['name']}</h4>
-                    <p style="font-size: 1.5em; font-weight: bold; color: #4C51BF;">${row['price_usd']:.2f}</p>
-                    <p style="font-size: 0.9em; color: #4A5568;">{row['description']}</p>
-                    <button style="background-color: #6B46C1; color: white; padding: 8px 15px; border: none; border-radius: 5px; cursor: pointer;">
-                        Add to Cart
-                    </button>
-                </div>
-                """, unsafe_allow_html=True)
-                # Adding a placeholder image to make the retail page look more appealing
-                st.image(f"https://placehold.co/400x300/6B46C1/ffffff?text={row['name'].replace(' ', '+')}", use_column_width=True)
+        if df_retail.empty:
+            st.info("The Retail Collection is currently empty. Check back soon for new exclusive designs!")
+        else:
+            # Display designs in a responsive grid format (Retail view)
+            cols = st.columns(3)
+            
+            for index, row in df_retail.iterrows():
+                with cols[index % 3]: # Cycle through columns
+                    # Card-like layout for each retail item
+                    st.markdown(f"""
+                    <div style="border: 2px solid #D6BCFA; border-radius: 10px; padding: 15px; margin-bottom: 20px; text-align: center; background-color: #F8F4FF; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+                        <h4 style="color: #6B46C1; margin-top: 0;">{row['name']}</h4>
+                        <p style="font-size: 1.5em; font-weight: bold; color: #4C51BF;">${row['price_usd']:.2f}</p>
+                        <p style="font-size: 0.9em; color: #4A5568;">{row['description']}</p>
+                        <button style="background-color: #6B46C1; color: white; padding: 8px 15px; border: none; border-radius: 5px; cursor: pointer; transition: background-color 0.3s;"
+                                onmouseover="this.style.backgroundColor='#553C9A'" onmouseout="this.style.backgroundColor='#6B46C1'">
+                            Add to Cart
+                        </button>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    # Adding a placeholder image to make the retail page look more appealing
+                    st.image(f"https://placehold.co/400x300/6B46C1/ffffff?text={row['name'].replace(' ', '+')}", use_column_width=True)
+
+    with tab2:
+        st.subheader("Bulk Order Catalog")
+        st.markdown("For wholesale customers: View our mass-produced items available for bulk purchase.")
+
+        if df_wholesale.empty:
+            st.info("The Wholesale Catalog is currently empty.")
+        else:
+            # Simple table view for wholesale items
+            df_display = df_wholesale[['name', 'description', 'price_usd']]
+            
+            st.dataframe(
+                df_display,
+                column_config={
+                    "name": "Product Name",
+                    "description": "Product Description",
+                    "price_usd": st.column_config.NumberColumn("Unit Price (Wholesale)", format="$%.2f"),
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            st.markdown("---")
+            st.warning("To place a bulk order, please contact our sales team using the information below.")
+            st.markdown("Email: `sales@tshirtco.com` | Phone: `(555) 555-5555`")
 
 
 def logout():
@@ -756,15 +789,15 @@ def main_app():
                 st.header("Customer Menu")
                 if st.button("Dashboard (Home)", key="nav_dash_cust"):
                     st.session_state['page'] = 'dashboard'
-                # The customer is directed to the view_designs_page which now acts as the retail storefront
-                if st.button("Retail Collection", key="nav_view_design"):
-                    st.session_state['page'] = 'view_designs'
+                # Updated navigation to reflect the combined view
+                if st.button("View Product Collections", key="nav_view_design"):
+                    st.session_state['page'] = 'view_product_collections'
 
             st.markdown("---")
             if st.button("Logout", type="secondary"):
                 logout()
         else:
-            st.info("Please log in or sign up. Use **customer1**/**customerpass** to view the retail section.")
+            st.info("Please log in or sign up. Use **customer1**/**customerpass** to view the product collections.")
 
     # --- Page Router ---
     if st.session_state['page'] == 'login' or not st.session_state['authenticated']:
@@ -777,8 +810,9 @@ def main_app():
         performance_and_sales_page() 
     elif st.session_state['page'] == 'manage_designs':
         manage_designs_page()
-    elif st.session_state['page'] == 'view_designs':
-        view_designs_page()
+    # Updated page routing
+    elif st.session_state['page'] == 'view_product_collections':
+        view_product_collections()
 
 if __name__ == '__main__':
     main_app()
