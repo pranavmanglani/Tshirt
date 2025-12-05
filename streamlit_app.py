@@ -43,8 +43,6 @@ def init_db():
     Initializes database tables and populates initial data.
     Uses a global lock to ensure this happens safely and only once, 
     preventing race conditions and 'database is locked' errors.
-    
-    CRITICAL CHANGE: USERS table is now created non-destructively to prevent losing signed-up users.
     """
     # Use the lock to ensure only one thread initializes the database at a time
     with DB_INIT_LOCK:
@@ -79,13 +77,18 @@ def init_db():
             c.execute("PRAGMA table_info(PRODUCTION_LOG)")
             prod_columns = [info[1] for info in c.fetchall()]
             
-            # Reinitialize if the crucial 'production_type' column is missing or tables are missing
-            needs_init = ('production_type' not in prod_columns) or (not prod_columns) 
+            # Check if DESIGNS table exists AND has the necessary column (retail_status).
+            # We are adding a new column 'retail_status' to distinguish if a design is retail/mass focused
+            c.execute("PRAGMA table_info(DESIGNS)")
+            design_columns = [info[1] for info in c.fetchall()]
+            
+            # Reinitialize if the crucial 'production_type' or the new 'retail_status' column is missing or tables are missing
+            needs_init = ('production_type' not in prod_columns) or (not prod_columns) or ('retail_status' not in design_columns)
 
             # Only perform the destructive drop/recreate if initialization is needed
             if needs_init:
                 # Drop and recreate production tables
-                st.info("Re-initializing production tables to add 'Mass'/'Retail' tracking.")
+                st.info("Re-initializing production tables to ensure all columns (including new 'retail_status') are present.")
                 c.executescript('''
                     DROP TABLE IF EXISTS DESIGNS;
                     DROP TABLE IF EXISTS PRODUCTION_LOG;
@@ -94,7 +97,8 @@ def init_db():
                         design_id INTEGER PRIMARY KEY,
                         name TEXT NOT NULL UNIQUE,
                         description TEXT,
-                        price_usd REAL NOT NULL DEFAULT 19.99
+                        price_usd REAL NOT NULL DEFAULT 19.99,
+                        retail_status TEXT NOT NULL DEFAULT 'Mass' -- NEW COLUMN: 'Mass' or 'Retail'
                     );
 
                     CREATE TABLE PRODUCTION_LOG (
@@ -104,15 +108,16 @@ def init_db():
                         size TEXT NOT NULL,
                         units_produced INTEGER NOT NULL,
                         defects INTEGER NOT NULL,
-                        production_type TEXT NOT NULL -- NEW COLUMN
+                        production_type TEXT NOT NULL
                     );
                 ''')
                 
-                # Populate Designs
-                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Logo Tee', 'Standard company logo print', 24.99))
-                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Abstract Art', 'Limited edition vibrant print', 35.50))
-                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Vintage Stripes', 'Classic striped design', 19.99))
-                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Holiday Special', 'Seasonal festive design', 29.00))
+                # Populate Designs (Marking some as Retail)
+                # Note: We are now controlling the channel via the DESIGNS table's retail_status
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", ('Logo Tee', 'Standard company logo print, highly affordable.', 24.99, 'Mass'))
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", ('Abstract Art', 'Limited edition vibrant print, premium cotton.', 35.50, 'Retail'))
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", ('Vintage Stripes', 'Classic striped design, durable everyday wear.', 19.99, 'Mass'))
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", ('Holiday Special', 'Seasonal festive design, unique embroidery.', 59.00, 'Retail'))
 
 
                 # Production Logs (Sample data for the last 30 days)
@@ -127,10 +132,10 @@ def init_db():
                     
                     # Mass production tends to be higher volume
                     data.append((log_date, 'Logo Tee', 'M', 100 + i*2, 5 + (i//5), production_types[0]))
-                    data.append((log_date, 'Abstract Art', 'S', 50 + i*3, 2 + (i//3), production_types[0]))
+                    data.append((log_date, 'Vintage Stripes', 'S', 50 + i*3, 2 + (i//3), production_types[0]))
                     
                     # Retail production for higher-priced items
-                    data.append((log_date, 'Vintage Stripes', 'L', 30 + i, 1 + (i//5), production_types[1]))
+                    data.append((log_date, 'Abstract Art', 'L', 30 + i, 1 + (i//5), production_types[1]))
                     if i <= 15:
                         data.append((log_date, 'Holiday Special', 'XL', 20 + i*2, 1 + (i//8), production_types[1]))
                     
@@ -160,6 +165,7 @@ def authenticate_user(username, password):
     c = conn.cursor()
     
     password_hash = hash_password(password)
+    # The role is now included in the SELECT query
     c.execute("SELECT * FROM USERS WHERE username = ? AND password_hash = ?", (username, password_hash))
     user = c.fetchone()
     conn.close()
@@ -237,7 +243,8 @@ def get_designs_data(cache_refresher):
     """Fetches design data using a cacheable function."""
     conn = get_db_connection()
     try:
-        df_designs = pd.read_sql_query("SELECT name, description, price_usd FROM DESIGNS ORDER BY name", conn)
+        # Query updated to include retail_status
+        df_designs = pd.read_sql_query("SELECT name, description, price_usd, retail_status FROM DESIGNS ORDER BY name", conn)
         return df_designs
     except pd.io.sql.DatabaseError as e:
         # st.error(f"Database Read Error: Could not fetch designs data. {e}")
@@ -270,7 +277,8 @@ def login_page():
                 if user:
                     st.session_state['authenticated'] = True
                     st.session_state['username'] = user['username']
-                    st.session_state['role'] = user['role']
+                    # The role is fetched from the database
+                    st.session_state['role'] = user['role'] 
                     st.session_state['page'] = 'dashboard' # Redirect after successful login
                     st.rerun()
                 else:
@@ -312,6 +320,10 @@ def signup_page():
 
 def performance_and_sales_page():
     """Displays improved production performance graphs and revenue metrics."""
+    if st.session_state.get('role') != 'admin':
+        st.error("Access Denied: Only Admins can view performance data.")
+        return
+
     st.title("📈 Production Performance and Sales Tracking")
     st.markdown("---")
 
@@ -527,11 +539,12 @@ def dashboard_page():
     if st.session_state['role'] == 'admin':
         st.header("Admin Overview")
         st.info("You have access to production logs and performance tracking. Use the sidebar menu to navigate.")
+        # Call the performance page directly for admin dashboard
         performance_and_sales_page() 
         
     elif st.session_state['role'] == 'customer':
         st.header("Customer Portal")
-        st.info("Explore our exclusive T-shirt designs.")
+        st.info("Explore our exclusive T-shirt designs from the retail channel.")
         view_designs_page()
 
 def manage_production_page():
@@ -551,8 +564,8 @@ def manage_production_page():
         return
 
     with st.form("production_log_form"):
-        # NEW INPUT FIELD
-        prod_type = st.selectbox("Production Type", ['Mass', 'Retail'], help="Select the sales channel for this batch.")
+        # Select the Production Type (Mass or Retail)
+        prod_type = st.selectbox("Production Channel", ['Mass', 'Retail'], help="Select the sales channel this batch is intended for.")
         
         prod_date = st.date_input("Date of Production", datetime.now().date())
         prod_name = st.selectbox("Product Design", designs)
@@ -603,7 +616,10 @@ def manage_designs_page():
         st.subheader("Add New Product Design") 
         with st.form("add_design_form"):
             name = st.text_input("Design Name (Unique)")
-            description = st.text_area("Description (e.g., color, material)")
+            description = st.area_input("Description (e.g., color, material, quality notes)")
+            
+            # NEW INPUT: Design channel/status
+            retail_status = st.selectbox("Primary Sales Channel", ['Mass', 'Retail'], help="Mass production is high volume, retail is often specialized or premium.")
             
             price_usd = st.number_input("Unit Price (USD)", min_value=0.01, step=0.01, format="%.2f", value=19.99)
             
@@ -615,7 +631,8 @@ def manage_designs_page():
                     try:
                         with conn:
                             c = conn.cursor()
-                            c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", (name, description, price_usd))
+                            # Insert statement updated to include retail_status
+                            c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", (name, description, price_usd, retail_status))
                         
                         # Invalidate the cache for design data after adding a new design
                         st.session_state['db_refresher'] = st.session_state.get('db_refresher', 0) + 1
@@ -632,25 +649,58 @@ def manage_designs_page():
                     st.error("Design Name cannot be empty.")
 
 def view_designs_page():
-    """Displays all available designs."""
-    st.subheader("Current T-Shirt Designs")
-    
+    """Displays designs relevant to the customer (Retail items)."""
     # Use the cached function to fetch design data
     df_designs = get_designs_data(st.session_state.get('db_refresher', 0))
 
-    if df_designs.empty:
-        st.info("No designs have been added yet.")
-    else:
+    if st.session_state.get('role') == 'admin':
+        st.subheader("All Product Designs (Admin View)")
+        if df_designs.empty:
+            st.info("No designs have been added yet.")
+            return
+
+        # Admin view shows all data in a table format
         st.dataframe(
             df_designs,
             column_config={
-                "name": st.column_config.TextColumn("Design Name", help="The unique name of the T-Shirt design"),
-                "description": st.column_config.TextColumn("Description", help="Details about the design and print style"),
-                "price_usd": st.column_config.NumberColumn("Unit Price", help="Selling price per unit", format="$%.2f")
+                "name": st.column_config.TextColumn("Design Name"),
+                "description": st.column_config.TextColumn("Description"),
+                "price_usd": st.column_config.NumberColumn("Unit Price", format="$%.2f"),
+                "retail_status": st.column_config.TextColumn("Channel") # Show the channel status to admin
             },
             hide_index=True,
             use_container_width=True
         )
+        return
+
+    # --- Customer View (Retail Focus) ---
+    st.title("🛍️ Retail Channel T-Shirt Collection")
+    st.markdown("Discover our exclusive and premium designs.")
+    
+    # Filter for 'Retail' status only
+    df_retail = df_designs[df_designs['retail_status'] == 'Retail']
+
+    if df_retail.empty:
+        st.info("The Retail Collection is currently empty. Check back soon for new exclusive designs!")
+    else:
+        # Display designs in a grid format
+        cols = st.columns(3)
+        
+        for index, row in df_retail.iterrows():
+            with cols[index % 3]: # Cycle through columns
+                # Card-like layout for each retail item
+                st.markdown(f"""
+                <div style="border: 2px solid #D6BCFA; border-radius: 10px; padding: 15px; margin-bottom: 20px; text-align: center; background-color: #F8F4FF;">
+                    <h4 style="color: #6B46C1;">{row['name']}</h4>
+                    <p style="font-size: 1.5em; font-weight: bold; color: #4C51BF;">${row['price_usd']:.2f}</p>
+                    <p style="font-size: 0.9em; color: #4A5568;">{row['description']}</p>
+                    <button style="background-color: #6B46C1; color: white; padding: 8px 15px; border: none; border-radius: 5px; cursor: pointer;">
+                        Add to Cart
+                    </button>
+                </div>
+                """, unsafe_allow_html=True)
+                # Adding a placeholder image to make the retail page look more appealing
+                st.image(f"https://placehold.co/400x300/6B46C1/ffffff?text={row['name'].replace(' ', '+')}", use_column_width=True)
 
 
 def logout():
@@ -706,14 +756,15 @@ def main_app():
                 st.header("Customer Menu")
                 if st.button("Dashboard (Home)", key="nav_dash_cust"):
                     st.session_state['page'] = 'dashboard'
-                if st.button("View Designs", key="nav_view_design"):
+                # The customer is directed to the view_designs_page which now acts as the retail storefront
+                if st.button("Retail Collection", key="nav_view_design"):
                     st.session_state['page'] = 'view_designs'
 
             st.markdown("---")
             if st.button("Logout", type="secondary"):
                 logout()
         else:
-            st.info("Please log in or sign up. Use **admin**/**adminpass** to view the charts.")
+            st.info("Please log in or sign up. Use **customer1**/**customerpass** to view the retail section.")
 
     # --- Page Router ---
     if st.session_state['page'] == 'login' or not st.session_state['authenticated']:
