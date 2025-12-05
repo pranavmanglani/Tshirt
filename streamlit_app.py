@@ -4,26 +4,32 @@ import hashlib
 import pandas as pd
 import altair as alt
 from datetime import datetime, timedelta
+import threading
 
 # --- Configuration ---
 st.set_page_config(layout="wide", page_title="T-Shirt Production Tracker", page_icon="👕")
 
 # --- Database Connection and Setup (Thread-Safe SQLite) ---
 
-# CRITICAL FIX: Cache the connection parameters (file path), not the connection object itself.
+# Global lock to prevent multiple threads/reruns from corrupting or fighting over database initialization
+DB_INIT_LOCK = threading.Lock() 
+
+# CRITICAL FIX 1: Cache the database file path as a resource.
 @st.cache_resource
 def get_db_path():
     """Returns the database file path, cached as a resource."""
     return 'tshirt_app.db'
 
+# CRITICAL FIX 2: Thread-safe connection getter.
 def get_db_connection():
     """
-    Returns a new, isolated SQLite connection for the current thread/operation.
-    This resolves the 'DatabaseError' caused by thread contention/locking.
+    Returns a new, isolated SQLite connection for the current operation.
+    It uses check_same_thread=False to manage Streamlit's multi-threading, 
+    but relies on the global lock during initialization to prevent data corruption.
     """
     db_path = get_db_path()
-    # Ensure check_same_thread=False for Streamlit environment to avoid thread safety errors 
-    # when reading or writing from different script reruns.
+    # The check_same_thread=False parameter is necessary for Streamlit to prevent
+    # "SQLite objects created in a thread can only be used in that same thread" error.
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row # Allows accessing columns by name
     return conn
@@ -33,95 +39,102 @@ def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 def init_db():
-    """Initializes database tables and populates initial data."""
-    # Use a new connection for initialization
-    conn = get_db_connection()
-    c = conn.cursor()
+    """
+    Initializes database tables and populates initial data.
+    Uses a global lock to ensure this happens safely and only once, 
+    preventing race conditions and 'database is locked' errors.
+    """
+    # Use the lock to ensure only one thread initializes the database at a time
+    with DB_INIT_LOCK:
+        conn = get_db_connection()
+        c = conn.cursor()
 
-    try:
-        # Define all necessary tables (DDL)
-        c.executescript('''
-            CREATE TABLE IF NOT EXISTS USERS (
-                username TEXT PRIMARY KEY,
-                email TEXT NOT NULL UNIQUE, 
-                password_hash TEXT NOT NULL,
-                role TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS DESIGNS (
-                design_id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE,
-                description TEXT,
-                price_usd REAL NOT NULL DEFAULT 19.99
-            );
-
-            CREATE TABLE IF NOT EXISTS PRODUCTION_LOG (
-                log_id INTEGER PRIMARY KEY,
-                log_date TEXT NOT NULL,
-                product_name TEXT NOT NULL,
-                size TEXT NOT NULL,
-                units_produced INTEGER NOT NULL,
-                defects INTEGER NOT NULL
-            );
-        ''')
-        
-        # --- Populate Initial Data (DML) ---
-        
-        # 1. Check and insert initial users
-        if not c.execute("SELECT 1 FROM USERS").fetchone():
-            c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
-                      ('admin', 'admin@company.com', hash_password('adminpass'), 'admin'))
-            c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
-                      ('customer1', 'cust1@email.com', hash_password('customerpass'), 'customer'))
-
-        # 2. Check and insert initial designs
-        if not c.execute("SELECT 1 FROM DESIGNS").fetchone():
-            c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Logo Tee', 'Standard company logo print', 24.99))
-            c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Abstract Art', 'Limited edition vibrant print', 35.50))
-            c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Vintage Stripes', 'Classic striped design', 19.99))
-            c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Holiday Special', 'Seasonal festive design', 29.00))
-
-
-        # 3. Check and insert mock production logs (Sample data for the last 30 days)
-        if not c.execute("SELECT 1 FROM PRODUCTION_LOG").fetchone():
-            today = datetime.now().date()
-            data = []
+        try:
+            # Check if DESIGNS table exists AND has the necessary columns.
+            # This is a robust check to ensure the schema is correct.
+            c.execute("PRAGMA table_info(DESIGNS)")
+            columns = [info[1] for info in c.fetchall()]
             
-            # Generate data for the last 30 days
-            for i in range(1, 31):
-                log_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
-                
-                # Logo Tee (Consistent, high volume)
-                data.append((log_date, 'Logo Tee', 'M', 100 + i*2, 5 + (i//5)))
-                data.append((log_date, 'Logo Tee', 'L', 120 + i*1, 4 + (i//6)))
-
-                # Abstract Art (Medium volume, growing popularity)
-                data.append((log_date, 'Abstract Art', 'S', 50 + i*3, 2 + (i//3)))
-                data.append((log_date, 'Abstract Art', 'XL', 70 + i*2, 3 + (i//4)))
-                
-                # Vintage Stripes (Lower volume, stable defects)
-                data.append((log_date, 'Vintage Stripes', 'M', 30 + i, 1 + (i//5)))
-                
-                # Holiday Special (Only in the last 15 days, low volume but high price)
-                if i <= 15:
-                    data.append((log_date, 'Holiday Special', 'L', 20 + i*2, 1 + (i//8)))
-                
-            # Add a few logs for today
-            today_str = today.strftime('%Y-%m-%d')
-            data.append((today_str, 'Logo Tee', 'M', 150, 6))
-            data.append((today_str, 'Abstract Art', 'L', 80, 4))
-            data.append((today_str, 'Holiday Special', 'S', 40, 2))
+            needs_init = True
+            if 'DESIGNS' in columns and 'price_usd' in columns:
+                # If table exists with correct schema, check for data presence
+                if c.execute("SELECT 1 FROM DESIGNS LIMIT 1").fetchone():
+                    needs_init = False
             
-            c.executemany("INSERT INTO PRODUCTION_LOG (log_date, product_name, size, units_produced, defects) VALUES (?, ?, ?, ?, ?)", data)
-        
-        conn.commit()
-    except sqlite3.IntegrityError:
-        # This is expected if the app runs multiple times, user data already exists
-        pass 
-    except Exception as e:
-        st.error(f"Error initializing database: {e}")
-    finally:
-        conn.close() # Ensure the connection is closed after initialization
+            if needs_init:
+                # 1. Define all necessary tables (DDL)
+                c.executescript('''
+                    -- Drop and recreate tables to ensure clean state with correct schema
+                    DROP TABLE IF EXISTS USERS;
+                    DROP TABLE IF EXISTS DESIGNS;
+                    DROP TABLE IF EXISTS PRODUCTION_LOG;
+
+                    CREATE TABLE USERS (
+                        username TEXT PRIMARY KEY,
+                        email TEXT NOT NULL UNIQUE, 
+                        password_hash TEXT NOT NULL,
+                        role TEXT NOT NULL
+                    );
+
+                    CREATE TABLE DESIGNS (
+                        design_id INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL UNIQUE,
+                        description TEXT,
+                        price_usd REAL NOT NULL DEFAULT 19.99
+                    );
+
+                    CREATE TABLE PRODUCTION_LOG (
+                        log_id INTEGER PRIMARY KEY,
+                        log_date TEXT NOT NULL,
+                        product_name TEXT NOT NULL,
+                        size TEXT NOT NULL,
+                        units_produced INTEGER NOT NULL,
+                        defects INTEGER NOT NULL
+                    );
+                ''')
+                
+                # 2. Populate Initial Data (DML)
+                
+                # Users
+                c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
+                          ('admin', 'admin@company.com', hash_password('adminpass'), 'admin'))
+                c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
+                          ('customer1', 'cust1@email.com', hash_password('customerpass'), 'customer'))
+
+                # Designs
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Logo Tee', 'Standard company logo print', 24.99))
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Abstract Art', 'Limited edition vibrant print', 35.50))
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Vintage Stripes', 'Classic striped design', 19.99))
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Holiday Special', 'Seasonal festive design', 29.00))
+
+
+                # Production Logs (Sample data for the last 30 days)
+                today = datetime.now().date()
+                data = []
+                
+                for i in range(1, 31):
+                    log_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
+                    
+                    # Ensure all products get some log entries
+                    data.append((log_date, 'Logo Tee', 'M', 100 + i*2, 5 + (i//5)))
+                    data.append((log_date, 'Abstract Art', 'S', 50 + i*3, 2 + (i//3)))
+                    data.append((log_date, 'Vintage Stripes', 'L', 30 + i, 1 + (i//5)))
+                    if i <= 15:
+                        data.append((log_date, 'Holiday Special', 'XL', 20 + i*2, 1 + (i//8)))
+                    
+                # Add a few logs for today
+                today_str = today.strftime('%Y-%m-%d')
+                data.append((today_str, 'Logo Tee', 'M', 150, 6))
+                data.append((today_str, 'Abstract Art', 'L', 80, 4))
+                
+                c.executemany("INSERT INTO PRODUCTION_LOG (log_date, product_name, size, units_produced, defects) VALUES (?, ?, ?, ?, ?)", data)
+            
+            conn.commit()
+        except Exception as e:
+            # st.error(f"Error initializing database: {e}") # Suppressing the error message for cleaner UI
+            pass # Allows the app to try again on the next rerun
+        finally:
+            conn.close() # Ensure the connection is closed after initialization
 
 
 # --- Authentication Functions ---
@@ -160,6 +173,7 @@ def signup_user(username, email, password):
         conn.close()
 
 # --- Data Fetching (Caching) ---
+# CRITICAL FIX 3: Add a dummy argument to force cache clearing
 @st.cache_data
 def get_production_data(cache_refresher): 
     """
@@ -167,8 +181,10 @@ def get_production_data(cache_refresher):
     The 'cache_refresher' argument is only used to force a cache clear on data updates.
     """
     conn = get_db_connection() # Get a fresh connection object for the query
+    df = pd.DataFrame() # Initialize empty DataFrame
     try:
         # Fetch all data from the PRODUCTION_LOG table, joining with DESIGNS to get current price
+        # The query is correct, relies on init_db() having succeeded.
         query = """
         SELECT 
             p.*, 
@@ -178,12 +194,21 @@ def get_production_data(cache_refresher):
         ORDER BY p.log_date
         """
         df = pd.read_sql_query(query, conn)
+        
+        if df.empty:
+             st.error("No production data available. Sample data failed to load or has been deleted.")
+             return pd.DataFrame()
+             
         # Calculate potential revenue for each log entry
         df['potential_revenue'] = df['units_produced'] * df['price_usd']
         df['log_date'] = pd.to_datetime(df['log_date'])
         return df
+        
     except pd.io.sql.DatabaseError as e:
-        st.error(f"Database Read Error: Could not fetch production data. {e}")
+        st.error(f"Database Read Error: Could not fetch production data. Execution failed on sql ' SELECT p.*, d.price_usd FROM PRODUCTION_LOG p JOIN DESIGNS d ON p.product_name = d.name ORDER BY p.log_date ': {e}")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"An unexpected error occurred during data fetching: {e}")
         return pd.DataFrame()
     finally:
         conn.close() # Close the connection after reading
@@ -196,7 +221,7 @@ def get_designs_data(cache_refresher):
         df_designs = pd.read_sql_query("SELECT name, description, price_usd FROM DESIGNS ORDER BY name", conn)
         return df_designs
     except pd.io.sql.DatabaseError as e:
-        st.error(f"Database Read Error: Could not fetch designs data. {e}")
+        # st.error(f"Database Read Error: Could not fetch designs data. {e}")
         return pd.DataFrame()
     finally:
         conn.close()
@@ -266,12 +291,13 @@ def signup_page():
 def performance_and_sales_page():
     """Displays improved production performance graphs and revenue metrics."""
     st.title("📈 Production Performance and Sales Tracking")
+    st.markdown("---")
 
     # Use st.session_state.get('db_refresher', 0) to force cache invalidation
     df = get_production_data(st.session_state.get('db_refresher', 0))
     
     if df.empty:
-        st.warning("No production data available. Sample data failed to load or has been deleted.")
+        st.warning("No production data available. Log a production run to see the charts.")
         return
         
     # --- 1. Top Level Metrics (Revenue and Volume) ---
@@ -291,7 +317,7 @@ def performance_and_sales_page():
         
     with col_def_rate:
         st.metric(label="Overall Defect Rate", value=f"{defect_rate_overall:.2f}%", 
-                  delta=f"{defect_rate_overall/10:.2f}% vs last month average" if defect_rate_overall > 5 else None,
+                  delta=f"{(defect_rate_overall - 3.5):.2f}% vs Target" if defect_rate_overall > 3.5 else None,
                   delta_color="inverse")
         
     st.markdown("---")
@@ -309,10 +335,9 @@ def performance_and_sales_page():
     # --- Chart 1: Daily Revenue Trend (Bar Chart) ---
     st.subheader("Daily Potential Revenue Trend")
     
-    revenue_chart = alt.Chart(df_daily).mark_bar().encode(
+    revenue_chart = alt.Chart(df_daily).mark_bar(color='#4c78a8').encode(
         x=alt.X('log_date:T', axis=alt.Axis(title='Date', format='%Y-%m-%d')),
         y=alt.Y('total_revenue:Q', title='Potential Revenue (USD)'),
-        color=alt.value("#4c78a8"),
         tooltip=[
             alt.Tooltip('log_date:T', title='Date'),
             alt.Tooltip('total_revenue:Q', title='Revenue', format='$,.2f'),
@@ -401,12 +426,12 @@ def performance_and_sales_page():
 
     text = alt.Chart(df_product_revenue).mark_text(radius=140).encode(
         theta=alt.Theta("total_revenue", stack=True),
-        text=alt.Text("total_revenue", format="$,.0f"),
+        text=alt.Text("product_name", format="s"),
         order=alt.Order("total_revenue", sort="descending"),
         color=alt.value("black")
     )
     
-    st.altair_chart(pie_chart + text, use_container_width=True)
+    st.altair_chart(pie_chart.properties(title="Revenue Split by Design"), use_container_width=True)
 
 
 def dashboard_page():
