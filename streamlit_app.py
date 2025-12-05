@@ -8,63 +8,24 @@ import requests
 import json
 from io import BytesIO
 
-# --- Constants and Configuration (unchanged) ---
-# Assuming these are correct from your previous file
+# --- Constants and Configuration ---
 DB_NAME = 'tshirt_shop.db'
 PRODUCT_ID = 1  # Fixed ID for the single T-shirt product
 
-# --- Database Management (unchanged or previously fixed) ---
+# --- Database Initialization and Connection ---
 
-# This function might need to be moved to global scope or a different pattern
-# if it's still causing the "database is locked" error, but for now,
-# we'll assume the previous threading fixes were applied.
-def get_db_connection():
-    # Streamlit recommends using a memoized function for database connection
-    # to handle retries and connection sharing across script reruns.
-    # Note: If you still see 'database is locked', you may need to ensure
-    # that init_db() is idempotent and not called multiple times concurrently.
-    if 'db_conn' not in st.session_state:
-        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-        st.session_state['db_conn'] = conn
-    return st.session_state['db_conn']
-
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def verify_user(username, password):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT password_hash FROM USERS WHERE username = ?", (username,))
-    result = c.fetchone()
-    if result:
-        return result[0] == hash_password(password)
-    return False
-
-def add_user(username, password):
-    conn = get_db_connection()
-    c = conn.cursor()
-    try:
-        c.execute("INSERT INTO USERS VALUES (?, ?, ?)", (username, hash_password(password), 'customer'))
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-
-def get_product_details(product_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT * FROM PRODUCTS WHERE product_id = ?", (product_id,))
-    row = c.fetchone()
-    if row:
-        return {'product_id': row[0], 'name': row[1], 'description': row[2], 'price': row[3], 'stock': row[4]}
-    return None
-
-# Placeholder function for database initialization (keep it idempotent)
-def init_db():
-    conn = get_db_connection()
+# FIX: Use @st.cache_resource to ensure the database connection and
+# initialization happen only once, preventing 'database is locked' errors.
+@st.cache_resource
+def get_db_connection_and_init():
+    """Initializes the database, creates tables, populates initial data,
+    and returns a thread-safe connection object."""
+    
+    # 1. Establish Connection (set check_same_thread=False for Streamlit environment)
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     c = conn.cursor()
 
-    # Define all necessary tables
+    # 2. Define all necessary tables
     c.executescript('''
         CREATE TABLE IF NOT EXISTS USERS (
             username TEXT PRIMARY KEY,
@@ -102,22 +63,68 @@ def init_db():
     ''')
     conn.commit()
 
-    # Add initial users
+    # 3. Add initial users (Idempotent: handles IntegrityError if already exists)
     try:
         c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
         c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
         conn.commit()
-    except sqlite3.IntegrityError: pass
+    except sqlite3.IntegrityError: 
+        pass # Users already exist
 
-    # Add initial product data if not present
-    product_data = get_product_details(PRODUCT_ID)
-    if product_data is None:
+    # 4. Add initial product data if not present (using a helper function below)
+    # We must commit the users first to prevent the operational error in case 
+    # the insertion point was the issue.
+    
+    # Check for product existence using the same connection
+    c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
+    product_data_exists = c.fetchone()
+    
+    if product_data_exists is None:
         try:
             c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
                       (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
             conn.commit()
-        except sqlite3.IntegrityError: pass
+        except sqlite3.IntegrityError: 
+            pass # Product already exists
 
+    return conn
+
+# Helper function to get the cached connection
+def get_db_connection():
+    """Returns the cached database connection object."""
+    return get_db_connection_and_init()
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_user(username, password):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT password_hash FROM USERS WHERE username = ?", (username,))
+    result = c.fetchone()
+    if result:
+        # Note: hash_password is used here again to hash the input password for comparison
+        return result[0] == hash_password(password)
+    return False
+
+def add_user(username, password):
+    conn = get_db_connection()
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO USERS VALUES (?, ?, ?)", (username, hash_password(password), 'customer'))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+def get_product_details(product_id):
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM PRODUCTS WHERE product_id = ?", (product_id,))
+    row = c.fetchone()
+    if row:
+        return {'product_id': row[0], 'name': row[1], 'description': row[2], 'price': row[3], 'stock': row[4]}
+    return None
 
 def place_order(username, cart_items, total_amount, full_name, address, city, zip_code):
     conn = get_db_connection()
@@ -127,7 +134,7 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
 
     try:
         # Start transaction
-        conn.execute('BEGIN TRANSACTION')
+        # conn.execute('BEGIN TRANSACTION') # No need for explicit begin transaction here, managed by commit/rollback
 
         # 1. Insert into ORDERS table
         c.execute("INSERT INTO ORDERS (order_id, username, order_date, total_amount, status) VALUES (?, ?, ?, ?, ?)",
@@ -135,7 +142,8 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
 
         # 2. Insert into ORDER_ITEMS and update stock
         for item in cart_items:
-            product = get_product_details(item['product_id'])
+            # Re-fetch product details to get current stock just before placing the order
+            product = get_product_details(item['product_id']) 
             if product and product['stock'] >= item['quantity']:
                 # Insert item
                 c.execute("INSERT INTO ORDER_ITEMS (order_id, product_id, size, quantity, unit_price) VALUES (?, ?, ?, ?, ?)",
@@ -145,17 +153,14 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
                 new_stock = product['stock'] - item['quantity']
                 c.execute("UPDATE PRODUCTS SET stock = ? WHERE product_id = ?", (new_stock, item['product_id']))
             else:
-                conn.execute('ROLLBACK')
+                conn.rollback() # Use rollback on failure
                 return False, "Error: Insufficient stock for product ID {}".format(item['product_id'])
-
-        # 3. Insert into a hypothetical SHIPPING_INFO table (optional, but good practice for checkout info)
-        # We'll just store this info in a list for now, but a real app needs a dedicated table.
 
         conn.commit()
         return True, order_id
 
     except Exception as e:
-        conn.execute('ROLLBACK')
+        conn.rollback() # Use rollback on failure
         st.error(f"Database error during order placement: {e}")
         return False, f"Order failed due to an internal error. {e}"
 
@@ -366,12 +371,12 @@ def dashboard_page():
 
 def main_app():
     """The main entry point for the Streamlit application."""
-    # Initialize DB (only run once per session using st.cache_resource)
-    if 'db_initialized' not in st.session_state:
-        init_db()
-        st.session_state['db_initialized'] = True
+    
+    # 1. Initialize DB Connection using the cached function
+    # This call runs the initialization only once globally.
+    get_db_connection_and_init() 
 
-    # Initialize session state variables
+    # 2. Initialize session state variables
     if 'logged_in' not in st.session_state:
         st.session_state['logged_in'] = False
         st.session_state['page'] = 'login' # Start at login page
