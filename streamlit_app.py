@@ -5,6 +5,7 @@ import pandas as pd
 import altair as alt
 from datetime import datetime, timedelta
 import threading
+import json # Import json for handling the cart data
 
 # --- Configuration ---
 st.set_page_config(layout="wide", page_title="T-Shirt Production Tracker", page_icon="👕")
@@ -78,7 +79,6 @@ def init_db():
             prod_columns = [info[1] for info in c.fetchall()]
             
             # Check if DESIGNS table exists AND has the necessary column (retail_status).
-            # We are adding a new column 'retail_status' to distinguish if a design is retail/mass focused
             c.execute("PRAGMA table_info(DESIGNS)")
             design_columns = [info[1] for info in c.fetchall()]
             
@@ -98,7 +98,7 @@ def init_db():
                         name TEXT NOT NULL UNIQUE,
                         description TEXT,
                         price_usd REAL NOT NULL DEFAULT 19.99,
-                        retail_status TEXT NOT NULL DEFAULT 'Mass' -- NEW COLUMN: 'Mass' or 'Retail'
+                        retail_status TEXT NOT NULL DEFAULT 'Mass' -- 'Mass' (Wholesale) or 'Retail' (Direct Customer)
                     );
 
                     CREATE TABLE PRODUCTION_LOG (
@@ -112,37 +112,37 @@ def init_db():
                     );
                 ''')
                 
-                # Populate Designs (Marking some as Retail)
-                # Note: We are now controlling the channel via the DESIGNS table's retail_status
-                c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", ('Logo Tee', 'Standard company logo print, highly affordable.', 24.99, 'Mass'))
-                c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", ('Abstract Art', 'Limited edition vibrant print, premium cotton.', 35.50, 'Retail'))
-                c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", ('Vintage Stripes', 'Classic striped design, durable everyday wear.', 19.99, 'Mass'))
-                c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", ('Holiday Special', 'Seasonal festive design, unique embroidery.', 59.00, 'Retail'))
+                # Populate Designs (Marking some as Retail for the direct customer view)
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", ('Cosmic Wave', 'High-fidelity screen print on premium Pima cotton. Exclusive design.', 39.99, 'Retail'))
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", ('Abstract Art', 'Limited edition vibrant print, premium cotton.', 55.50, 'Retail'))
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", ('Logo Tee', 'Standard company logo print, 100% durable cotton.', 19.99, 'Mass'))
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", ('Vintage Stripes', 'Classic striped design, durable everyday wear.', 17.50, 'Mass'))
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd, retail_status) VALUES (?, ?, ?, ?)", ('Eco Blend Basic', 'Simple sustainable fabric blend, perfect for bulk.', 21.00, 'Mass'))
 
 
                 # Production Logs (Sample data for the last 30 days)
                 today = datetime.now().date()
                 data = []
                 
-                # Split sample data between Mass and Retail
                 production_types = ['Mass', 'Retail']
                 
                 for i in range(1, 31):
                     log_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
                     
-                    # Mass production tends to be higher volume (Wholesale Catalog)
+                    # Mass production
                     data.append((log_date, 'Logo Tee', 'M', 100 + i*2, 5 + (i//5), production_types[0]))
                     data.append((log_date, 'Vintage Stripes', 'S', 50 + i*3, 2 + (i//3), production_types[0]))
+                    data.append((log_date, 'Eco Blend Basic', 'L', 120 + i, 6 + (i//6), production_types[0]))
                     
-                    # Retail production for higher-priced items (Retail Collection)
-                    data.append((log_date, 'Abstract Art', 'L', 30 + i, 1 + (i//5), production_types[1]))
+                    # Retail production
+                    data.append((log_date, 'Cosmic Wave', 'L', 30 + i, 1 + (i//5), production_types[1]))
                     if i <= 15:
-                        data.append((log_date, 'Holiday Special', 'XL', 20 + i*2, 1 + (i//8), production_types[1]))
+                        data.append((log_date, 'Abstract Art', 'XL', 20 + i*2, 1 + (i//8), production_types[1]))
                     
                 # Add a few logs for today
                 today_str = today.strftime('%Y-%m-%d')
                 data.append((today_str, 'Logo Tee', 'M', 150, 6, 'Mass'))
-                data.append((today_str, 'Abstract Art', 'L', 80, 4, 'Retail'))
+                data.append((today_str, 'Cosmic Wave', 'L', 80, 4, 'Retail'))
                 
                 # Use a specific list of columns for the insert
                 insert_cols = "(log_date, product_name, size, units_produced, defects, production_type)"
@@ -151,10 +151,10 @@ def init_db():
             
             conn.commit()
         except Exception as e:
-            # st.error(f"Error initializing database: {e}") # Suppressing the error message for cleaner UI
-            pass # Allows the app to try again on the next rerun
+            # st.error(f"Error initializing database: {e}") 
+            pass 
         finally:
-            conn.close() # Ensure the connection is closed after initialization
+            conn.close() 
 
 
 # --- Authentication Functions ---
@@ -199,17 +199,13 @@ def signup_user(username, email, password):
         conn.close()
 
 # --- Data Fetching (Caching) ---
-# CRITICAL FIX 3: Add a dummy argument to force cache clearing
 @st.cache_data
 def get_production_data(cache_refresher): 
-    """
-    Fetches production log data. 
-    The 'cache_refresher' argument is only used to force a cache clear on data updates.
-    """
-    conn = get_db_connection() # Get a fresh connection object for the query
-    df = pd.DataFrame() # Initialize empty DataFrame
+    """Fetches production log data."""
+    conn = get_db_connection() 
+    df = pd.DataFrame() 
     try:
-        # Fetch all data, now including production_type
+        # Fetch all data, now including production_type and price_usd
         query = """
         SELECT 
             p.*, 
@@ -221,22 +217,17 @@ def get_production_data(cache_refresher):
         df = pd.read_sql_query(query, conn)
         
         if df.empty:
-             st.warning("No production data available. Log a production run to see the charts.")
              return pd.DataFrame()
              
-        # Calculate potential revenue for each log entry
         df['potential_revenue'] = df['units_produced'] * df['price_usd']
         df['log_date'] = pd.to_datetime(df['log_date'])
         return df
         
-    except pd.io.sql.DatabaseError as e:
-        # st.error(f"Database Read Error: Could not fetch production data. {e}")
-        return pd.DataFrame()
     except Exception as e:
-        # st.error(f"An unexpected error occurred during data fetching: {e}")
+        # print(f"Error fetching data: {e}") # Debugging
         return pd.DataFrame()
     finally:
-        conn.close() # Close the connection after reading
+        conn.close() 
 
 @st.cache_data
 def get_designs_data(cache_refresher):
@@ -246,13 +237,55 @@ def get_designs_data(cache_refresher):
         # Query updated to include retail_status
         df_designs = pd.read_sql_query("SELECT name, description, price_usd, retail_status FROM DESIGNS ORDER BY name", conn)
         return df_designs
-    except pd.io.sql.DatabaseError as e:
-        # st.error(f"Database Read Error: Could not fetch designs data. {e}")
+    except Exception as e:
+        # print(f"Error fetching designs: {e}") # Debugging
         return pd.DataFrame()
     finally:
         conn.close()
 
 
+# --- Cart Functions (Simulated in Session State) ---
+def add_to_cart(design_name, size, quantity, price):
+    """Adds an item to the session state cart."""
+    if 'cart' not in st.session_state:
+        st.session_state['cart'] = []
+    
+    # Create a unique key for the item (name + size)
+    item_key = f"{design_name}-{size}"
+    
+    # Check if item already exists in the cart
+    found = False
+    for item in st.session_state['cart']:
+        if item['key'] == item_key:
+            item['quantity'] += quantity
+            found = True
+            break
+            
+    if not found:
+        st.session_state['cart'].append({
+            'key': item_key,
+            'name': design_name,
+            'size': size,
+            'quantity': quantity,
+            'price': price,
+            'subtotal': quantity * price
+        })
+    else:
+        # Update subtotal if item was already found
+        for item in st.session_state['cart']:
+            if item['key'] == item_key:
+                item['subtotal'] = item['quantity'] * item['price']
+    
+    # Force the display to refresh to reflect the new cart item
+    st.session_state['page'] = 'view_cart'
+    st.rerun()
+
+def clear_cart():
+    """Clears all items from the cart."""
+    st.session_state['cart'] = []
+    st.session_state['page'] = 'view_product_collections'
+    st.rerun()
+    
 # --- App Pages ---
 
 def login_page():
@@ -317,9 +350,9 @@ def signup_page():
                 else:
                     st.error(message)
 
-
+# --- Performance and Sales Page (Admin Only) ---
 def performance_and_sales_page():
-    """Displays improved production performance graphs and revenue metrics."""
+    """Displays production performance graphs and revenue metrics (Admin Only)."""
     if st.session_state.get('role') != 'admin':
         st.error("Access Denied: Only Admins can view performance data.")
         return
@@ -334,6 +367,7 @@ def performance_and_sales_page():
         st.warning("No production data available. Log a production run to see the charts.")
         return
         
+    # [Rest of the performance_and_sales_page function remains the same as previous step]
     # --- 1. Top Level Metrics (Revenue and Volume) ---
     total_revenue = df['potential_revenue'].sum()
     total_units_produced = df['units_produced'].sum()
@@ -544,15 +578,16 @@ def dashboard_page():
         
     elif st.session_state['role'] == 'customer':
         st.header("Customer Portal")
-        st.info("Choose a collection below: Retail for premium items, Wholesale for bulk orders.")
-        view_product_collections() # Redirect to the new combined view
+        # Direct customer to the collection view
+        view_product_collections() 
 
 def manage_production_page():
     """Allows admins to log new production runs."""
     if st.session_state.get('role') != 'admin':
         st.error("Access Denied: Only Admins can manage production.")
         return
-
+        
+    # [Rest of the manage_production_page function remains the same as previous step]
     # Use the cached function to get current designs data
     df_designs = get_designs_data(st.session_state.get('db_refresher', 0))
     designs = df_designs['name'].tolist()
@@ -607,7 +642,8 @@ def manage_designs_page():
     if st.session_state.get('role') != 'admin':
         st.error("Access Denied: Only Admins can manage designs.")
         return
-
+        
+    # [Rest of the manage_designs_page function remains the same as previous step]
     st.title("Product (Design) Management") 
     
     col1, col2 = st.columns([1, 2])
@@ -648,9 +684,53 @@ def manage_designs_page():
                 else:
                     st.error("Design Name cannot be empty.")
 
+# --- NEW: Product Detail View with Cart Functionality ---
+def product_detail_page(design_name):
+    """Displays the detail page for a single design and allows adding to cart."""
+    df_designs = get_designs_data(st.session_state.get('db_refresher', 0))
+    design_data = df_designs[df_designs['name'] == design_name].iloc[0]
+
+    st.title(f"Product Details: {design_name}")
+    st.subheader(f"Price: ${design_data['price_usd']:.2f}")
+
+    col_img, col_info = st.columns([1, 2])
+    
+    with col_img:
+        # Placeholder image
+        st.image(f"https://placehold.co/400x400/3182CE/ffffff?text={design_name.replace(' ', '+')}", 
+                 caption=f"{design_name} Design", use_column_width=True)
+
+    with col_info:
+        st.markdown(f"**Description:** {design_data['description']}")
+        st.markdown(f"**Channel:** {design_data['retail_status']} (Typically direct customer sale)")
+        
+        st.markdown("---")
+        st.subheader("Add to Cart")
+        
+        with st.form(f"add_to_cart_form_{design_name}"):
+            size = st.selectbox("Select Size", ['S', 'M', 'L', 'XL', 'XXL'], key=f"size_{design_name}")
+            quantity = st.number_input("Quantity", min_value=1, value=1, step=1, key=f"qty_{design_name}")
+            
+            add_submitted = st.form_submit_button("🛒 Add to Cart")
+            
+            if add_submitted:
+                add_to_cart(design_name, size, quantity, design_data['price_usd'])
+                st.success(f"{quantity}x {size} {design_name} added to your cart!")
+                # No rerun here, add_to_cart handles the redirect to cart page
+
+    st.markdown("---")
+    if st.button("← Back to Collections"):
+        st.session_state['selected_design'] = None
+        st.rerun()
+
+# --- Combined Collections View (Customer Only) ---
 def view_product_collections():
     """Displays separate Retail and Wholesale views for the customer."""
-    # Use the cached function to fetch design data
+    # Check if a design is selected for detail view
+    if st.session_state.get('selected_design'):
+        product_detail_page(st.session_state['selected_design'])
+        return
+        
     df_designs = get_designs_data(st.session_state.get('db_refresher', 0))
 
     if st.session_state.get('role') == 'admin':
@@ -666,7 +746,7 @@ def view_product_collections():
                 "name": st.column_config.TextColumn("Design Name"),
                 "description": st.column_config.TextColumn("Description"),
                 "price_usd": st.column_config.NumberColumn("Unit Price", format="$%.2f"),
-                "retail_status": st.column_config.TextColumn("Channel") # Show the channel status to admin
+                "retail_status": st.column_config.TextColumn("Channel") 
             },
             hide_index=True,
             use_container_width=True
@@ -685,7 +765,7 @@ def view_product_collections():
 
     with tab1:
         st.subheader("Premium & Exclusive Designs")
-        st.markdown("Browse our unique, limited-edition designs for individual purchase.")
+        st.markdown("Browse our unique, limited-edition designs. Click **'View Details'** to purchase.")
         
         if df_retail.empty:
             st.info("The Retail Collection is currently empty. Check back soon for new exclusive designs!")
@@ -696,19 +776,24 @@ def view_product_collections():
             for index, row in df_retail.iterrows():
                 with cols[index % 3]: # Cycle through columns
                     # Card-like layout for each retail item
+                    design_name = row['name']
+                    # Use unique keys for buttons
+                    button_key = f"view_{design_name}" 
+                    
                     st.markdown(f"""
-                    <div style="border: 2px solid #D6BCFA; border-radius: 10px; padding: 15px; margin-bottom: 20px; text-align: center; background-color: #F8F4FF; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
-                        <h4 style="color: #6B46C1; margin-top: 0;">{row['name']}</h4>
-                        <p style="font-size: 1.5em; font-weight: bold; color: #4C51BF;">${row['price_usd']:.2f}</p>
-                        <p style="font-size: 0.9em; color: #4A5568;">{row['description']}</p>
-                        <button style="background-color: #6B46C1; color: white; padding: 8px 15px; border: none; border-radius: 5px; cursor: pointer; transition: background-color 0.3s;"
-                                onmouseover="this.style.backgroundColor='#553C9A'" onmouseout="this.style.backgroundColor='#6B46C1'">
-                            Add to Cart
-                        </button>
+                    <div style="border: 2px solid #3182CE; border-radius: 10px; padding: 15px; margin-bottom: 20px; text-align: center; background-color: #EBF8FF; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+                        <h4 style="color: #2B6CB0; margin-top: 0;">{design_name}</h4>
+                        <p style="font-size: 1.5em; font-weight: bold; color: #3182CE;">${row['price_usd']:.2f}</p>
+                        <p style="font-size: 0.9em; color: #4A5568;">{row['description'].split('.')[0]}.</p>
                     </div>
                     """, unsafe_allow_html=True)
-                    # Adding a placeholder image to make the retail page look more appealing
-                    st.image(f"https://placehold.co/400x300/6B46C1/ffffff?text={row['name'].replace(' ', '+')}", use_column_width=True)
+                    # Adding a placeholder image
+                    st.image(f"https://placehold.co/400x300/3182CE/ffffff?text={design_name.replace(' ', '+')}", use_column_width=True)
+
+                    # Button to go to the detail page (simulating product click)
+                    if st.button("View Details", key=button_key, use_container_width=True):
+                         st.session_state['selected_design'] = design_name
+                         st.rerun()
 
     with tab2:
         st.subheader("Bulk Order Catalog")
@@ -733,17 +818,73 @@ def view_product_collections():
             
             st.markdown("---")
             st.warning("To place a bulk order, please contact our sales team using the information below.")
-            st.markdown("Email: `tanisk@gmail.com`")
+            st.markdown("Email: `sales@tshirtco.com` | Phone: `(555) 555-5555`")
+
+def view_cart_page():
+    """Displays the simulated shopping cart contents."""
+    st.title("🛒 Your Shopping Cart")
+
+    cart = st.session_state.get('cart', [])
+    
+    if not cart:
+        st.info("Your cart is currently empty.")
+        if st.button("Continue Shopping", key="cont_shop_empty"):
+            st.session_state['page'] = 'view_product_collections'
+            st.rerun()
+        return
+
+    # Convert cart list of dictionaries to DataFrame for display
+    cart_df = pd.DataFrame(cart)
+    
+    # Calculate total cart value
+    total_price = cart_df['subtotal'].sum()
+    
+    st.subheader(f"Total Items: {len(cart_df)}")
+    st.subheader(f"Cart Total: ${total_price:,.2f}")
+    st.markdown("---")
+
+    # Display the cart in a user-friendly table
+    st.dataframe(
+        cart_df[['name', 'size', 'quantity', 'price', 'subtotal']],
+        column_config={
+            "name": "Product",
+            "size": "Size",
+            "quantity": st.column_config.NumberColumn("Qty", format="%d"),
+            "price": st.column_config.NumberColumn("Unit Price", format="$%.2f"),
+            "subtotal": st.column_config.NumberColumn("Subtotal", format="$%.2f")
+        },
+        hide_index=True,
+        use_container_width=True
+    )
+
+    col_btn1, col_btn2, col_btn3 = st.columns(3)
+    
+    with col_btn1:
+        if st.button("Continue Shopping", key="cont_shop_full", use_container_width=True):
+            st.session_state['page'] = 'view_product_collections'
+            st.rerun()
+    with col_btn2:
+        if st.button("Clear Cart", key="clear_cart_btn", type="secondary", use_container_width=True):
+            clear_cart()
+    with col_btn3:
+        if st.button("Proceed to Checkout (Simulated)", key="checkout_btn", type="primary", use_container_width=True):
+            st.success(f"Checkout Simulated! Total order value: ${total_price:,.2f}. Thank you for your order, {st.session_state['username']}!")
+            clear_cart()
 
 
 def logout():
     """Logs the user out and clears session state."""
     st.session_state['authenticated'] = False
-    # Clear specific user session keys but keep app configuration keys
     if 'username' in st.session_state:
         del st.session_state['username']
     if 'role' in st.session_state:
         del st.session_state['role']
+    # Also clear shopping cart on logout
+    if 'cart' in st.session_state:
+        del st.session_state['cart']
+    if 'selected_design' in st.session_state:
+        del st.session_state['selected_design']
+        
     st.session_state['page'] = 'login'
     st.rerun()
 
@@ -758,9 +899,15 @@ def main_app():
         st.session_state['page'] = 'login'
     if 'page' not in st.session_state:
          st.session_state['page'] = 'login'
-    # Initialize db_refresher for cache invalidation
     if 'db_refresher' not in st.session_state:
         st.session_state['db_refresher'] = 0
+    # Initialize state for the shopping cart (empty list)
+    if 'cart' not in st.session_state:
+        st.session_state['cart'] = []
+    # Initialize state for product detail navigation
+    if 'selected_design' not in st.session_state:
+        st.session_state['selected_design'] = None
+
 
     # --- Sidebar Navigation ---
     with st.sidebar:
@@ -778,20 +925,32 @@ def main_app():
                 st.header("Admin Menu")
                 if st.button("Dashboard (Home)", key="nav_dash"):
                     st.session_state['page'] = 'dashboard'
+                    st.session_state['selected_design'] = None # Clear product view state
                 if st.button("Log Production", key="nav_prod"):
                     st.session_state['page'] = 'manage_production'
+                    st.session_state['selected_design'] = None
                 if st.button("Performance & Sales", key="nav_perf"):
                     st.session_state['page'] = 'performance_tracking'
+                    st.session_state['selected_design'] = None
                 if st.button("Manage Designs", key="nav_design"):
                     st.session_state['page'] = 'manage_designs'
+                    st.session_state['selected_design'] = None
             
             elif st.session_state['role'] == 'customer':
                 st.header("Customer Menu")
                 if st.button("Dashboard (Home)", key="nav_dash_cust"):
                     st.session_state['page'] = 'dashboard'
-                # Updated navigation to reflect the combined view
-                if st.button("View Product Collections", key="nav_view_design"):
+                    st.session_state['selected_design'] = None
+                if st.button("View Collections", key="nav_view_design"):
                     st.session_state['page'] = 'view_product_collections'
+                    st.session_state['selected_design'] = None
+                
+                # Cart button for customers
+                cart_count = sum(item['quantity'] for item in st.session_state.get('cart', []))
+                cart_label = f"🛒 View Cart ({cart_count})"
+                if st.button(cart_label, key="nav_view_cart", type="primary"):
+                    st.session_state['page'] = 'view_cart'
+                    st.session_state['selected_design'] = None
 
             st.markdown("---")
             if st.button("Logout", type="secondary"):
@@ -810,9 +969,10 @@ def main_app():
         performance_and_sales_page() 
     elif st.session_state['page'] == 'manage_designs':
         manage_designs_page()
-    # Updated page routing
     elif st.session_state['page'] == 'view_product_collections':
         view_product_collections()
+    elif st.session_state['page'] == 'view_cart':
+        view_cart_page()
 
 if __name__ == '__main__':
     main_app()
