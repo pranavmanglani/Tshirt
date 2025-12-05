@@ -104,7 +104,7 @@ def initialize_database(target_db_path):
             c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
             c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
 
-            # Add initial product data
+            # Add initial product data (we keep the single product for simplicity as requested)
             c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
                     (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
                     
@@ -297,6 +297,25 @@ def place_order(username, cart_items, final_amount, full_name, address, city, zi
          st.error(f"Database error during order placement: {e}")
          return False, f"Order failed due to an internal error: {e}"
 
+def add_product(name, description, price, stock):
+    """Adds a new product to the database."""
+    try:
+        # Use an arbitrary ID for new products since the initial one is fixed (PRODUCT_ID=1)
+        db_manager.execute_query("INSERT INTO PRODUCTS (name, description, price, stock) VALUES (?, ?, ?, ?)", 
+                                 (name, description, price, stock), commit=True)
+        return True
+    except Exception as e:
+        st.error(f"Error adding product: {e}")
+        return False
+        
+def delete_product(product_id):
+    """Deletes a product from the database."""
+    try:
+        db_manager.execute_query("DELETE FROM PRODUCTS WHERE product_id = ?", (product_id,), commit=True)
+        return True
+    except Exception as e:
+        st.error(f"Error deleting product: {e}")
+        return False
 
 # --- Streamlit Page Functions ---
 
@@ -320,6 +339,9 @@ def login_page():
                     st.rerun()
                 else:
                     st.error("Invalid username or password.")
+            st.markdown("---")
+            st.caption("Admin: `admin` / `admin` | Customer: `customer1` / `customer1`")
+
 
     with col2:
         with st.form("signup_form"):
@@ -342,18 +364,30 @@ def login_page():
 def product_page():
     st.title("T-Shirt Store")
 
-    product = get_product_details(PRODUCT_ID)
-    if not product:
-        st.error("Product details are currently unavailable. The database may still be initializing. Please refresh.")
+    # Fetch all products now, not just one, to allow for future expansion
+    df_products = db_manager.fetch_query_df("SELECT * FROM PRODUCTS")
+    
+    if df_products.empty:
+        st.info("No products available in the shop right now.")
         return
 
+    # For simplicity, we still focus on the single product ID 1 for detailed view and hardcoded image
+    product = get_product_details(PRODUCT_ID)
+    if not product:
+        # Fallback if product ID 1 was somehow deleted, use the first available product
+        first_product_row = df_products.iloc[0]
+        product = first_product_row.to_dict()
+        product['product_id'] = first_product_row['product_id']
+        st.warning(f"Default product not found. Showing {product['name']}.")
+        
     st.subheader(product['name'])
     st.write(product['description'])
     st.markdown(f"**Price:** ${product['price']:.2f}")
     st.markdown(f"**Stock:** {product['stock']} available")
     st.info("Wholesale pricing: 10% off when buying 10 or more items!")
 
-    st.image("https://placehold.co/400x400/36454F/FFFFFF?text=Awesome+Code+Tee", caption="Our Awesome T-Shirt Design", use_column_width=False)
+    # Using the hardcoded image URL for the main featured product
+    st.image("https://placehold.co/400x400/36454F/FFFFFF?text=Awesome+Code+Tee", caption=f"The {product['name']}", use_column_width=False)
 
     st.subheader("Select Options")
     
@@ -367,7 +401,7 @@ def product_page():
     
     with col_qty:
         max_qty = product['stock'] 
-        existing_item = next((item for item in st.session_state['cart'] if item['product_id'] == PRODUCT_ID and item['size'] == size), None)
+        existing_item = next((item for item in st.session_state['cart'] if item['product_id'] == product['product_id'] and item['size'] == size), None)
         default_qty = existing_item['quantity'] if existing_item else 1
         
         if default_qty > max_qty:
@@ -378,12 +412,14 @@ def product_page():
     with col_add:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("Add to Cart"):
+            # Use the product ID from the currently displayed product
+            current_product_id = product['product_id']
             if quantity > 0 and quantity <= max_qty:
                 
                 new_total, bulk_discount = calculate_item_total(product['price'], quantity)
 
                 new_item = {
-                    'product_id': PRODUCT_ID,
+                    'product_id': current_product_id,
                     'name': product['name'],
                     'size': size,
                     'quantity': quantity,
@@ -395,7 +431,7 @@ def product_page():
                 cart_updated = False
                 for i in range(len(st.session_state['cart'])):
                     item = st.session_state['cart'][i]
-                    if item['product_id'] == PRODUCT_ID and item['size'] == size:
+                    if item['product_id'] == current_product_id and item['size'] == size:
                         st.session_state['cart'][i].update(new_item) # Update existing item
                         cart_updated = True
                         break
@@ -555,6 +591,57 @@ def order_complete_page():
         st.session_state['page'] = 'shop'
         st.rerun()
 
+def admin_product_management():
+    """Allows admin to add and delete products."""
+    st.markdown("### 🛠️ Product Management")
+    
+    # --- Add Product Form ---
+    with st.expander("➕ Add New Product", expanded=False):
+        with st.form("add_product_form", clear_on_submit=True):
+            st.subheader("Product Details")
+            new_name = st.text_input("Product Name", max_chars=100)
+            new_desc = st.text_area("Description")
+            col_price, col_stock = st.columns(2)
+            with col_price:
+                new_price = st.number_input("Price ($)", min_value=0.01, format="%.2f")
+            with col_stock:
+                new_stock = st.number_input("Initial Stock", min_value=0, step=1)
+                
+            if st.form_submit_button("Add Product"):
+                if new_name and new_desc and new_price > 0 and new_stock >= 0:
+                    if add_product(new_name, new_desc, new_price, new_stock):
+                        st.success(f"Product '{new_name}' added successfully!")
+                        st.rerun()
+                    else:
+                        st.error("Failed to add product.")
+                else:
+                    st.error("Please fill out all product details correctly.")
+
+    # --- Delete Product Section ---
+    st.markdown("---")
+    st.markdown("##### Delete Existing Product")
+    df_products = db_manager.fetch_query_df("SELECT product_id, name, price, stock FROM PRODUCTS")
+    
+    if not df_products.empty:
+        # Create a dictionary for easy selection
+        product_options = {f"{row['name']} (ID: {row['product_id']})": row['product_id'] for index, row in df_products.iterrows()}
+        selected_product_name = st.selectbox("Select Product to Delete", list(product_options.keys()))
+        
+        if selected_product_name:
+            product_to_delete_id = product_options[selected_product_name]
+            
+            if st.button(f"Delete '{selected_product_name}'", type="primary"):
+                if delete_product(product_to_delete_id):
+                    st.success(f"Product ID {product_to_delete_id} deleted.")
+                    st.rerun()
+                else:
+                    st.error("Could not delete product.")
+    
+    st.markdown("---")
+    st.markdown("##### Current Catalog")
+    st.dataframe(df_products, hide_index=True, use_container_width=True)
+
+
 def dashboard_page():
     st.title("User Dashboard")
     st.subheader(f"Welcome, {st.session_state['username'].capitalize()}")
@@ -573,46 +660,57 @@ def dashboard_page():
     else:
         st.subheader("Your Order History")
         display_cols = ['order_id', 'order_date', 'total_amount', 'status']
-        st.dataframe(df_orders[display_cols], hide_index=True, use_container_width=True)
+        # Convert total_amount to currency format for better display
+        df_display = df_orders.copy()
+        df_display['total_amount'] = df_display['total_amount'].apply(lambda x: f"${x:.2f}")
+
+        st.dataframe(df_display[display_cols], hide_index=True, use_container_width=True)
 
     if st.session_state['username'] == 'admin':
         st.subheader("Admin Panel")
+
+        # Tab navigation for Admin features
+        tab_analytics, tab_products = st.tabs(["📊 Sales & Inventory Analytics", "📦 Product Management"])
         
-        # Fetch all orders for admin
-        df_all_orders = db_manager.fetch_query_df("SELECT order_id, username, order_date, total_amount, status, full_name FROM ORDERS ORDER BY order_date DESC")
+        with tab_products:
+            admin_product_management()
         
-        # --- Admin Charts Section ---
-        st.markdown("### 📊 Sales Analytics")
-        
-        if not df_all_orders.empty:
-            # Prepare data: Ensure order_date is a proper date type for charting
-            df_all_orders['order_date'] = pd.to_datetime(df_all_orders['order_date']).dt.date
+        with tab_analytics:
+            # Fetch all orders for admin
+            df_all_orders = db_manager.fetch_query_df("SELECT order_id, username, order_date, total_amount, status, full_name FROM ORDERS ORDER BY order_date DESC")
             
-            # 1. Daily Sales Over Time (Line Chart)
-            sales_daily = df_all_orders.groupby('order_date')['total_amount'].sum().reset_index()
-            sales_daily.rename(columns={'total_amount': 'Daily Sales'}, inplace=True)
+            # --- Admin Charts Section ---
+            st.markdown("### 📈 Sales Analytics & Charts")
             
-            st.markdown("#### Daily Sales Total")
-            st.line_chart(sales_daily, x='order_date', y='Daily Sales')
+            if not df_all_orders.empty:
+                # Prepare data: Ensure order_date is a proper date type for charting
+                df_all_orders['order_date'] = pd.to_datetime(df_all_orders['order_date']).dt.date
+                
+                # 1. Daily Sales Over Time (Line Chart)
+                sales_daily = df_all_orders.groupby('order_date')['total_amount'].sum().reset_index()
+                sales_daily.rename(columns={'total_amount': 'Daily Sales'}, inplace=True)
+                
+                st.markdown("#### Daily Sales Total Over Time")
+                st.line_chart(sales_daily, x='order_date', y='Daily Sales')
+                
+                # 2. Order Status Distribution (Bar Chart - The 'VS' graph)
+                status_counts = df_all_orders['status'].value_counts().reset_index()
+                status_counts.columns = ['Status', 'Count']
+                
+                st.markdown("#### Order Status Breakdown")
+                st.bar_chart(status_counts, x='Status', y='Count')
+                
+            else:
+                st.info("No sales data available for charts.")
+                
+            st.markdown("#### Raw Data Tables")
+            st.markdown("##### All Orders")
+            st.dataframe(df_all_orders[['order_id', 'username', 'order_date', 'total_amount', 'status']], hide_index=True, use_container_width=True)
             
-            # 2. Order Status Distribution (Bar Chart)
-            status_counts = df_all_orders['status'].value_counts().reset_index()
-            status_counts.columns = ['Status', 'Count']
-            
-            st.markdown("#### Order Status Breakdown")
-            st.bar_chart(status_counts, x='Status', y='Count')
-            
-        else:
-            st.info("No sales data available for charts.")
-            
-        st.markdown("#### Raw Data Tables")
-        st.markdown("##### All Orders")
-        st.dataframe(df_all_orders[['order_id', 'username', 'order_date', 'total_amount', 'status']], hide_index=True, use_container_width=True)
-        
-        # Fetch product stock for admin
-        df_products = db_manager.fetch_query_df("SELECT product_id, name, price, stock FROM PRODUCTS")
-        st.markdown("##### Product Stock")
-        st.dataframe(df_products, hide_index=True, use_container_width=True)
+            # Fetch product stock for admin
+            df_products = db_manager.fetch_query_df("SELECT product_id, name, price, stock FROM PRODUCTS")
+            st.markdown("##### Current Stock Levels")
+            st.dataframe(df_products, hide_index=True, use_container_width=True)
 
 # --- Main App Logic ---
 
@@ -646,6 +744,8 @@ def main_app():
                 st.session_state['logged_in'] = False
                 st.session_state['username'] = None
                 st.session_state['cart'] = []
+                st.session_state['coupon_discount'] = 0.0 # Clear session state data
+                st.session_state['coupon_code'] = ''
                 st.session_state['page'] = 'login'
                 st.rerun()
 
