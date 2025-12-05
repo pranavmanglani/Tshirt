@@ -74,21 +74,18 @@ def init_db():
 
 
             # --- DESIGNS and PRODUCTION_LOG Tables (Initial Data Setup) ---
-            # These tables are still checked and recreated if necessary to ensure fresh sample data and correct schema.
             
-            # Check if DESIGNS table exists AND has the necessary columns (price_usd).
-            c.execute("PRAGMA table_info(DESIGNS)")
-            columns = [info[1] for info in c.fetchall()]
+            # Check if PRODUCTION_LOG table exists AND has the necessary column (production_type).
+            c.execute("PRAGMA table_info(PRODUCTION_LOG)")
+            prod_columns = [info[1] for info in c.fetchall()]
             
-            needs_init = True
-            # We check the table info to see if the table exists AND has the required columns from our last fix
-            if 'name' in columns and 'price_usd' in columns:
-                # If table exists with correct schema, check for data presence
-                if c.execute("SELECT 1 FROM DESIGNS LIMIT 1").fetchone():
-                    needs_init = False
-            
+            # Reinitialize if the crucial 'production_type' column is missing or tables are missing
+            needs_init = ('production_type' not in prod_columns) or (not prod_columns) 
+
+            # Only perform the destructive drop/recreate if initialization is needed
             if needs_init:
                 # Drop and recreate production tables
+                st.info("Re-initializing production tables to add 'Mass'/'Retail' tracking.")
                 c.executescript('''
                     DROP TABLE IF EXISTS DESIGNS;
                     DROP TABLE IF EXISTS PRODUCTION_LOG;
@@ -106,7 +103,8 @@ def init_db():
                         product_name TEXT NOT NULL,
                         size TEXT NOT NULL,
                         units_produced INTEGER NOT NULL,
-                        defects INTEGER NOT NULL
+                        defects INTEGER NOT NULL,
+                        production_type TEXT NOT NULL -- NEW COLUMN
                     );
                 ''')
                 
@@ -121,22 +119,30 @@ def init_db():
                 today = datetime.now().date()
                 data = []
                 
+                # Split sample data between Mass and Retail
+                production_types = ['Mass', 'Retail']
+                
                 for i in range(1, 31):
                     log_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
                     
-                    # Ensure all products get some log entries
-                    data.append((log_date, 'Logo Tee', 'M', 100 + i*2, 5 + (i//5)))
-                    data.append((log_date, 'Abstract Art', 'S', 50 + i*3, 2 + (i//3)))
-                    data.append((log_date, 'Vintage Stripes', 'L', 30 + i, 1 + (i//5)))
+                    # Mass production tends to be higher volume
+                    data.append((log_date, 'Logo Tee', 'M', 100 + i*2, 5 + (i//5), production_types[0]))
+                    data.append((log_date, 'Abstract Art', 'S', 50 + i*3, 2 + (i//3), production_types[0]))
+                    
+                    # Retail production for higher-priced items
+                    data.append((log_date, 'Vintage Stripes', 'L', 30 + i, 1 + (i//5), production_types[1]))
                     if i <= 15:
-                        data.append((log_date, 'Holiday Special', 'XL', 20 + i*2, 1 + (i//8)))
+                        data.append((log_date, 'Holiday Special', 'XL', 20 + i*2, 1 + (i//8), production_types[1]))
                     
                 # Add a few logs for today
                 today_str = today.strftime('%Y-%m-%d')
-                data.append((today_str, 'Logo Tee', 'M', 150, 6))
-                data.append((today_str, 'Abstract Art', 'L', 80, 4))
+                data.append((today_str, 'Logo Tee', 'M', 150, 6, 'Mass'))
+                data.append((today_str, 'Abstract Art', 'L', 80, 4, 'Retail'))
                 
-                c.executemany("INSERT INTO PRODUCTION_LOG (log_date, product_name, size, units_produced, defects) VALUES (?, ?, ?, ?, ?)", data)
+                # Use a specific list of columns for the insert
+                insert_cols = "(log_date, product_name, size, units_produced, defects, production_type)"
+                insert_placeholder = "(?, ?, ?, ?, ?, ?)"
+                c.executemany(f"INSERT INTO PRODUCTION_LOG {insert_cols} VALUES {insert_placeholder}", data)
             
             conn.commit()
         except Exception as e:
@@ -197,7 +203,7 @@ def get_production_data(cache_refresher):
     conn = get_db_connection() # Get a fresh connection object for the query
     df = pd.DataFrame() # Initialize empty DataFrame
     try:
-        # Fetch all data from the PRODUCTION_LOG table, joining with DESIGNS to get current price
+        # Fetch all data, now including production_type
         query = """
         SELECT 
             p.*, 
@@ -209,7 +215,7 @@ def get_production_data(cache_refresher):
         df = pd.read_sql_query(query, conn)
         
         if df.empty:
-             st.warning("No production data available. Sample data failed to load or has been deleted.")
+             st.warning("No production data available. Log a production run to see the charts.")
              return pd.DataFrame()
              
         # Calculate potential revenue for each log entry
@@ -218,8 +224,7 @@ def get_production_data(cache_refresher):
         return df
         
     except pd.io.sql.DatabaseError as e:
-        # This error is expected if the production tables haven't been created yet
-        # st.error(f"Database Read Error: Could not fetch production data. Execution failed on sql ' SELECT p.*, d.price_usd FROM PRODUCTION_LOG p JOIN DESIGNS d ON p.product_name = d.name ORDER BY p.log_date ': {e}")
+        # st.error(f"Database Read Error: Could not fetch production data. {e}")
         return pd.DataFrame()
     except Exception as e:
         # st.error(f"An unexpected error occurred during data fetching: {e}")
@@ -339,7 +344,49 @@ def performance_and_sales_page():
         
     st.markdown("---")
 
-    # 2. Prepare Daily Aggregation Data
+    # --- 2. Production Type Breakdown ---
+    st.header("Breakdown by Production Type (Mass vs. Retail)")
+    
+    df_type_summary = df.groupby('production_type').agg(
+        total_units=('units_produced', 'sum'),
+        total_revenue=('potential_revenue', 'sum'),
+        total_defects=('defects', 'sum')
+    ).reset_index()
+
+    # Calculate defect rate for each type
+    df_type_summary['defect_rate'] = (df_type_summary['total_defects'] / df_type_summary['total_units']) * 100
+    df_type_summary.loc[df_type_summary['total_units'] == 0, 'defect_rate'] = 0 
+    
+    col_mass, col_retail = st.columns(2)
+
+    # Display metrics for Mass
+    mass_data = df_type_summary[df_type_summary['production_type'] == 'Mass'].iloc[0] if 'Mass' in df_type_summary['production_type'].values else None
+    
+    with col_mass:
+        st.subheader("Mass Production")
+        if mass_data is not None:
+            st.metric("Units Produced", f"{mass_data['total_units']:,}")
+            st.metric("Potential Revenue", f"${mass_data['total_revenue']:,.2f}")
+            st.metric("Defect Rate", f"{mass_data['defect_rate']:.2f}%", help="Total defects as a percentage of total units produced.")
+        else:
+            st.info("No Mass production data logged.")
+
+    # Display metrics for Retail
+    retail_data = df_type_summary[df_type_summary['production_type'] == 'Retail'].iloc[0] if 'Retail' in df_type_summary['production_type'].values else None
+    
+    with col_retail:
+        st.subheader("Retail Production")
+        if retail_data is not None:
+            st.metric("Units Produced", f"{retail_data['total_units']:,}")
+            st.metric("Potential Revenue", f"${retail_data['total_revenue']:,.2f}")
+            st.metric("Defect Rate", f"{retail_data['defect_rate']:.2f}%", help="Total defects as a percentage of total units produced.")
+        else:
+            st.info("No Retail production data logged.")
+            
+    st.markdown("---")
+
+
+    # 3. Prepare Daily Aggregation Data
     df_daily = df.groupby('log_date').agg(
         total_units=('units_produced', 'sum'),
         total_defects=('defects', 'sum'),
@@ -361,19 +408,41 @@ def performance_and_sales_page():
             alt.Tooltip('total_units:Q', title='Units Produced', format=',.0f'),
         ]
     ).properties(
-        title='Daily Revenue from Production Volume'
+        title='Daily Revenue from Production Volume (Total)'
     ).interactive()
     st.altair_chart(revenue_chart, use_container_width=True)
 
     st.markdown("---")
     
+    # --- Chart 2: Revenue Trend by Production Type (Line Chart) ---
+    st.subheader("Revenue Trend by Production Type")
+    df_daily_type = df.groupby(['log_date', 'production_type']).agg(
+        daily_revenue=('potential_revenue', 'sum')
+    ).reset_index()
+
+    type_revenue_chart = alt.Chart(df_daily_type).mark_line(point=True).encode(
+        x=alt.X('log_date:T', title='Date'),
+        y=alt.Y('daily_revenue:Q', title='Daily Revenue (USD)'),
+        color=alt.Color('production_type:N', title="Channel"),
+        tooltip=[
+            alt.Tooltip('log_date:T', title='Date'),
+            alt.Tooltip('production_type:N', title='Channel'),
+            alt.Tooltip('daily_revenue:Q', title='Revenue', format='$,.2f')
+        ]
+    ).properties(
+        title='Revenue Split by Mass vs. Retail Over Time'
+    ).interactive()
+    st.altair_chart(type_revenue_chart, use_container_width=True)
+    
+    st.markdown("---")
+
     # Melt data for the layered chart (Production vs Defects)
     df_melted = df_daily.melt(id_vars=['log_date'], 
                              value_vars=['total_units', 'total_defects'], 
                              var_name='Metric', 
                              value_name='Count')
 
-    # --- Chart 2: Daily Units vs. Defects (Layered Column Chart) ---
+    # --- Chart 3: Daily Units vs. Defects (Layered Column Chart) ---
     st.subheader("Daily Production Volume vs. Daily Defects (Quality Control)")
     
     base = alt.Chart(df_melted).encode(
@@ -401,7 +470,7 @@ def performance_and_sales_page():
     
     st.markdown("---")
 
-    # --- Chart 3: Defect Rate Trend (%) (Line Chart) ---
+    # --- Chart 4: Defect Rate Trend (%) (Line Chart) ---
     st.subheader("Defect Rate Trend (%)")
 
     rate_chart = alt.Chart(df_daily).mark_line(point=True, strokeWidth=3, color='#F06E6E').encode(
@@ -414,14 +483,14 @@ def performance_and_sales_page():
             alt.Tooltip('total_defects:Q', title='Total Defects', format=',.0f'),
         ]
     ).properties(
-        title='Defect Rate Percentage Over Time'
+        title='Defect Rate Percentage Over Time (Total)'
     ).interactive() 
     
     st.altair_chart(rate_chart, use_container_width=True)
 
     st.markdown("---")
 
-    # --- Chart 4: Product Contribution to Revenue (Pie Chart) ---
+    # --- Chart 5: Product Contribution to Revenue (Pie Chart) ---
     st.subheader("Revenue Contribution by Design")
 
     df_product_revenue = df.groupby('product_name').agg(
@@ -482,6 +551,9 @@ def manage_production_page():
         return
 
     with st.form("production_log_form"):
+        # NEW INPUT FIELD
+        prod_type = st.selectbox("Production Type", ['Mass', 'Retail'], help="Select the sales channel for this batch.")
+        
         prod_date = st.date_input("Date of Production", datetime.now().date())
         prod_name = st.selectbox("Product Design", designs)
         prod_size = st.selectbox("Size", ['XS', 'S', 'M', 'L', 'XL', 'XXL'])
@@ -498,11 +570,12 @@ def manage_production_page():
                 try:
                     with conn:
                         c = conn.cursor()
+                        # Insert statement updated to include production_type
                         c.execute(
-                            "INSERT INTO PRODUCTION_LOG (log_date, product_name, size, units_produced, defects) VALUES (?, ?, ?, ?, ?)",
-                            (prod_date.strftime('%Y-%m-%d'), prod_name, prod_size, units_produced, defects)
+                            "INSERT INTO PRODUCTION_LOG (log_date, product_name, size, units_produced, defects, production_type) VALUES (?, ?, ?, ?, ?, ?)",
+                            (prod_date.strftime('%Y-%m-%d'), prod_name, prod_size, units_produced, defects, prod_type)
                         )
-                    st.success(f"Production log for {units_produced} units of {prod_name} added successfully!")
+                    st.success(f"Production log for {units_produced} units of {prod_name} ({prod_type}) added successfully!")
                     
                     # CRITICAL FIX: Increment a state variable to invalidate the @st.cache_data in get_production_data
                     if 'db_refresher' not in st.session_state:
