@@ -28,7 +28,8 @@ def init_db():
     conn = get_db_connection()
     c = conn.cursor()
 
-    # Define all necessary tables
+    # Define all necessary tables (DDL)
+    # DDL is executed outside the DML transaction block
     c.executescript('''
         -- UPDATED: Added EMAIL column for sign-up
         CREATE TABLE IF NOT EXISTS USERS (
@@ -54,42 +55,46 @@ def init_db():
         );
     ''')
 
-    # Add initial data if tables are empty
+    # Add initial data if tables are empty (DML)
     try:
-        # Add initial users (with new EMAIL column)
-        if not c.execute("SELECT 1 FROM USERS").fetchone():
-            c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
-                      ('admin', 'admin@company.com', hash_password('adminpass'), 'admin'))
-            c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
-                      ('customer1', 'cust1@email.com', hash_password('customerpass'), 'customer'))
+        # Use 'with conn:' context manager to ensure proper transaction boundaries (COMMIT/ROLLBACK)
+        # This resolves the "cannot start a transaction within a transaction" error.
+        with conn:
+            # Add initial users (with new EMAIL column)
+            if not c.execute("SELECT 1 FROM USERS").fetchone():
+                c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
+                          ('admin', 'admin@company.com', hash_password('adminpass'), 'admin'))
+                c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
+                          ('customer1', 'cust1@email.com', hash_password('customerpass'), 'customer'))
 
-        # Add initial designs
-        if not c.execute("SELECT 1 FROM DESIGNS").fetchone():
-            c.execute("INSERT INTO DESIGNS (name, description) VALUES (?, ?)", ('Logo Tee', 'Standard company logo print'))
-            c.execute("INSERT INTO DESIGNS (name, description) VALUES (?, ?)", ('Abstract Art', 'Limited edition vibrant print'))
-            c.execute("INSERT INTO DESIGNS (name, description) VALUES (?, ?)", ('Vintage Stripes', 'Classic striped design'))
+            # Add initial designs
+            if not c.execute("SELECT 1 FROM DESIGNS").fetchone():
+                c.execute("INSERT INTO DESIGNS (name, description) VALUES (?, ?)", ('Logo Tee', 'Standard company logo print'))
+                c.execute("INSERT INTO DESIGNS (name, description) VALUES (?, ?)", ('Abstract Art', 'Limited edition vibrant print'))
+                c.execute("INSERT INTO DESIGNS (name, description) VALUES (?, ?)", ('Vintage Stripes', 'Classic striped design'))
 
-        # Add mock production logs for chart demonstration
-        if not c.execute("SELECT 1 FROM PRODUCTION_LOG").fetchone():
-            today = datetime.now().date()
-            data = [
-                ((today - timedelta(days=7)).strftime('%Y-%m-%d'), 'Logo Tee', 'M', 100, 5),
-                ((today - timedelta(days=6)).strftime('%Y-%m-%d'), 'Logo Tee', 'L', 120, 4),
-                ((today - timedelta(days=6)).strftime('%Y-%m-%d'), 'Abstract Art', 'S', 50, 1),
-                ((today - timedelta(days=5)).strftime('%Y-%m-%d'), 'Vintage Stripes', 'XL', 80, 2),
-                ((today - timedelta(days=4)).strftime('%Y-%m-%d'), 'Logo Tee', 'M', 150, 6),
-                ((today - timedelta(days=3)).strftime('%Y-%m-%d'), 'Abstract Art', 'L', 70, 3),
-                ((today - timedelta(days=2)).strftime('%Y-%m-%d'), 'Logo Tee', 'M', 90, 4),
-                ((today - timedelta(days=1)).strftime('%Y-%m-%d'), 'Vintage Stripes', 'M', 110, 3),
-                (today.strftime('%Y-%m-%d'), 'Logo Tee', 'S', 130, 5),
-            ]
-            c.executemany("INSERT INTO PRODUCTION_LOG (log_date, product_name, size, units_produced, defects) VALUES (?, ?, ?, ?, ?)", data)
+            # Add mock production logs for chart demonstration
+            if not c.execute("SELECT 1 FROM PRODUCTION_LOG").fetchone():
+                today = datetime.now().date()
+                data = [
+                    ((today - timedelta(days=7)).strftime('%Y-%m-%d'), 'Logo Tee', 'M', 100, 5),
+                    ((today - timedelta(days=6)).strftime('%Y-%m-%d'), 'Logo Tee', 'L', 120, 4),
+                    ((today - timedelta(days=6)).strftime('%Y-%m-%d'), 'Abstract Art', 'S', 50, 1),
+                    ((today - timedelta(days=5)).strftime('%Y-%m-%d'), 'Vintage Stripes', 'XL', 80, 2),
+                    ((today - timedelta(days=4)).strftime('%Y-%m-%d'), 'Logo Tee', 'M', 150, 6),
+                    ((today - timedelta(days=3)).strftime('%Y-%m-%d'), 'Abstract Art', 'L', 70, 3),
+                    ((today - timedelta(days=2)).strftime('%Y-%m-%d'), 'Logo Tee', 'M', 90, 4),
+                    ((today - timedelta(days=1)).strftime('%Y-%m-%d'), 'Vintage Stripes', 'M', 110, 3),
+                    (today.strftime('%Y-%m-%d'), 'Logo Tee', 'S', 130, 5),
+                ]
+                c.executemany("INSERT INTO PRODUCTION_LOG (log_date, product_name, size, units_produced, defects) VALUES (?, ?, ?, ?, ?)", data)
             
-        conn.commit()
+        # conn.commit() is implicitly called by 'with conn:' on success
     except sqlite3.IntegrityError:
         # This handles cases where initial data might already be present
         pass
     except Exception as e:
+        # Catch any other initialization errors
         st.error(f"Error initializing data: {e}")
 
 
@@ -105,23 +110,28 @@ def authenticate_user(username, password):
     user = c.fetchone()
     return user
 
-def signup_user(username, email, password, role):
-    """Registers a new user (admin/customer)."""
+def signup_user(username, email, password): # Removed 'role' argument
+    """Registers a new user, always assigning the 'customer' role."""
     conn = get_db_connection()
-    c = conn.cursor()
     
-    # Check if username or email already exists
-    if c.execute("SELECT username FROM USERS WHERE username = ? OR email = ?", (username, email)).fetchone():
-        return False, "Username or Email already exists."
-    
-    password_hash = hash_password(password)
+    # Check if username or email already exists and insert using transaction context manager
     try:
-        c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
-                  (username, email, password_hash, role))
-        conn.commit()
-        return True, "Registration successful. You can now log in."
+        with conn:
+            c = conn.cursor()
+            if c.execute("SELECT username FROM USERS WHERE username = ? OR email = ?", (username, email)).fetchone():
+                return False, "Username or Email already exists."
+            
+            password_hash = hash_password(password)
+            # HARDCODE ROLE: Assign 'customer' role to all new sign-ups
+            default_role = 'customer' 
+            c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
+                      (username, email, password_hash, default_role))
+            # conn.commit() is implicitly called by 'with conn:'
+            return True, "Registration successful. You can now log in."
     except sqlite3.IntegrityError:
         return False, "Database error during registration."
+    except Exception as e:
+        return False, f"An unexpected error occurred: {e}"
 
 
 # --- App Pages ---
@@ -158,16 +168,17 @@ def login_page():
         signup_page()
 
 def signup_page():
-    """Handles user sign-up."""
+    """Handles user sign-up. Role selection removed."""
     st.subheader("New User Sign Up")
     with st.form("signup_form"):
-        st.markdown("##### Create a New Account")
+        st.markdown("##### Create a New Customer Account")
         new_username = st.text_input("Username", key="su_username")
-        # NEW: Email field added
+        # Email field
         new_email = st.text_input("Email", key="su_email", help="Required for notifications and identification.")
         new_password = st.text_input("Password", type="password", key="su_password")
         confirm_password = st.text_input("Confirm Password", type="password", key="su_confirm_password")
-        new_role = st.selectbox("Role", ["customer", "admin"], key="su_role")
+        
+        # REMOVED: new_role = st.selectbox("Role", ["customer", "admin"], key="su_role")
         
         signup_submitted = st.form_submit_button("Sign Up")
         
@@ -179,7 +190,8 @@ def signup_page():
             elif not "@" in new_email:
                 st.error("Please enter a valid email address.")
             else:
-                success, message = signup_user(new_username, new_email, new_password, new_role)
+                # Call signup_user without the role argument
+                success, message = signup_user(new_username, new_email, new_password)
                 if success:
                     st.success(message)
                     st.balloons()
@@ -323,12 +335,13 @@ def manage_production_page():
                 st.error("Defects cannot exceed total units produced.")
             else:
                 try:
-                    c = conn.cursor()
-                    c.execute(
-                        "INSERT INTO PRODUCTION_LOG (log_date, product_name, size, units_produced, defects) VALUES (?, ?, ?, ?, ?)",
-                        (prod_date.strftime('%Y-%m-%d'), prod_name, prod_size, units_produced, defects)
-                    )
-                    conn.commit()
+                    with conn:
+                        c = conn.cursor()
+                        c.execute(
+                            "INSERT INTO PRODUCTION_LOG (log_date, product_name, size, units_produced, defects) VALUES (?, ?, ?, ?, ?)",
+                            (prod_date.strftime('%Y-%m-%d'), prod_name, prod_size, units_produced, defects)
+                        )
+                        # conn.commit() is implicitly called by 'with conn:'
                     st.success(f"Production log for {units_produced} units of {prod_name} added successfully!")
                 except Exception as e:
                     st.error(f"Failed to log production: {e}")
@@ -354,9 +367,10 @@ def manage_designs_page():
             if submitted:
                 if name:
                     try:
-                        c = conn.cursor()
-                        c.execute("INSERT INTO DESIGNS (name, description) VALUES (?, ?)", (name, description))
-                        conn.commit()
+                        with conn:
+                            c = conn.cursor()
+                            c.execute("INSERT INTO DESIGNS (name, description) VALUES (?, ?)", (name, description))
+                            # conn.commit() is implicitly called by 'with conn:'
                         st.success(f"Design '{name}' added successfully!")
                     except sqlite3.IntegrityError:
                         st.error("A design with this name already exists.")
