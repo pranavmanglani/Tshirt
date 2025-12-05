@@ -12,29 +12,55 @@ import time
 DB_NAME = 'tshirt_shop.db'
 PRODUCT_ID = 1  # Fixed ID for the single T-shirt product
 
+# --- Database Cleanup (Run before @st.cache_resource) ---
+def clean_locked_db(db_path):
+    """Attempts to remove a locked database file."""
+    if os.path.exists(db_path):
+        try:
+            # Attempt a connection with a short timeout to see if it's locked
+            test_conn = sqlite3.connect(db_path, timeout=0.1)
+            test_conn.close()
+            # If we reached here, the file is not locked, proceed
+            return False
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e):
+                st.warning(f"Database file '{db_path}' found locked. Deleting it for a fresh start.")
+                try:
+                    os.remove(db_path)
+                    st.toast("Locked database file successfully removed.")
+                    return True
+                except Exception as file_error:
+                    st.error(f"Could not remove locked database file. Please restart the app. Error: {file_error}")
+                    return False
+            else:
+                return False
+        except Exception:
+            return False # Ignore other errors
+
+# Aggressively try to clean the file at startup
+clean_locked_db(DB_NAME)
+
 # --- Database Management Class (The Guarantee) ---
 class DBManager:
     """
     Manages the SQLite connection and enforces thread safety using a Lock.
-    This ensures only one Streamlit thread accesses the database at a time.
     """
     def __init__(self, db_path):
         self.db_path = db_path
         self._lock = Lock()
-        self._conn = None
+        self._conn = self._get_connection()
         self._initialize_db()
 
     def _get_connection(self):
         """Creates or returns the connection, ensuring only one connection exists."""
-        if self._conn is None:
-            # Use a longer timeout (30s) and set check_same_thread=False
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
-            self._conn.row_factory = sqlite3.Row # Ensure we can access columns by name
-        return self._conn
+        # Use a longer timeout (30s) and set check_same_thread=False
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+        conn.row_factory = sqlite3.Row # Ensure we can access columns by name
+        return conn
 
     def _initialize_db(self):
         """Creates tables and populates initial data idempotently."""
-        conn = self._get_connection()
+        conn = self._conn
         c = conn.cursor()
         
         # 1. Define all necessary tables using IF NOT EXISTS
@@ -93,7 +119,7 @@ class DBManager:
             conn.commit()
 
         # 3. Add initial product data (Idempotent check)
-        # This is the query that failed due to the lock in the previous run:
+        # This is the line that keeps crashing due to locks.
         c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
         if c.fetchone() is None:
             c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
@@ -103,7 +129,7 @@ class DBManager:
     def execute_query(self, query, params=(), commit=False):
         """Executes a non-SELECT query with thread lock protection."""
         with self._lock:
-            conn = self._get_connection()
+            conn = self._conn
             c = conn.cursor()
             try:
                 c.execute(query, params)
@@ -111,7 +137,6 @@ class DBManager:
                     conn.commit()
                 return c
             except sqlite3.OperationalError as e:
-                # Rollback/re-raise if a query operation fails
                 conn.rollback()
                 raise e
             except Exception as e:
@@ -121,7 +146,7 @@ class DBManager:
     def fetch_query(self, query, params=()):
         """Executes a SELECT query and fetches results with thread lock protection."""
         with self._lock:
-            conn = self._get_connection()
+            conn = self._conn
             c = conn.cursor()
             try:
                 c.execute(query, params)
@@ -132,9 +157,8 @@ class DBManager:
     def fetch_query_df(self, query, params=()):
         """Executes a SELECT query and fetches results as a Pandas DataFrame."""
         with self._lock:
-            conn = self._get_connection()
+            conn = self._conn
             try:
-                # pd.read_sql_query handles its own concurrency mechanism, which benefits from the Lock outside
                 df = pd.read_sql_query(query, conn, params=params)
                 return df
             except Exception as e:
@@ -143,44 +167,9 @@ class DBManager:
 # --- Global Database Manager Instance ---
 @st.cache_resource
 def get_db_manager():
-    """
-    Initializes and returns the thread-safe DBManager instance. 
-    Includes aggressive lock resolution and retries.
-    """
-    
-    max_retries = 3
-    
-    for attempt in range(max_retries):
-        try:
-            # Step 1: Attempt to establish a test connection immediately
-            test_conn = sqlite3.connect(DB_NAME, timeout=5)
-            test_conn.close()
-
-            # If connection is successful, initialize the manager
-            return DBManager(DB_NAME)
-
-        except sqlite3.OperationalError as e:
-            if "database is locked" in str(e) and os.path.exists(DB_NAME) and attempt < max_retries - 1:
-                # Step 2: Aggressive lock resolution by deleting the file
-                st.warning(f"Attempt {attempt + 1}: Database is locked. Deleting and recreating the file for a clean start...")
-                try:
-                    os.remove(DB_NAME)
-                    st.toast("Database file successfully deleted. Retrying initialization.")
-                    time.sleep(1) # Give the OS time to release the file handle
-                    continue # Retry the loop
-                except Exception as file_error:
-                    st.error(f"Failed to delete locked database file: {file_error}. Retrying...")
-                    time.sleep(2)
-            else:
-                # If it's the last attempt or a different error, re-raise
-                st.error(f"Failed to initialize database after {attempt + 1} attempts due to a lock or error: {e}")
-                raise e
-        except Exception as e:
-            st.error(f"An unexpected error occurred during database setup: {e}")
-            raise e
-            
-    # Should be unreachable, but good practice to handle all paths
-    raise Exception("Database initialization failed permanently after retries.")
+    """Initializes and returns the thread-safe DBManager instance."""
+    # This function is now simplified as the aggressive cleanup happens outside.
+    return DBManager(DB_NAME)
 
 db_manager = get_db_manager()
 
@@ -234,7 +223,7 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
     try:
         # Acquire Lock and perform transaction
         with db_manager._lock:
-            conn = db_manager._get_connection()
+            conn = db_manager._conn
             c = conn.cursor()
             
             # 1. Insert into ORDERS table 
