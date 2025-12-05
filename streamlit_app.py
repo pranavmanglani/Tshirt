@@ -12,26 +12,27 @@ import time
 DB_NAME = 'tshirt_shop.db'
 PRODUCT_ID = 1  # Fixed ID for the single T-shirt product
 MAX_RETRIES = 5
-RETRY_DELAY_SEC = 0.5
+RETRY_DELAY_SEC = 1.0 # Increased delay for higher resilience
 
 # --- Database Cleanup (Run before @st.cache_resource) ---
 def clean_locked_db(db_path):
     """Attempts to remove a locked database file."""
-    # This aggressive cleanup remains outside the cache to handle initial locks
     if os.path.exists(db_path):
         try:
             # Attempt a connection with a very short timeout (microsecond level)
+            # If this fails, the file is likely locked by another process
             test_conn = sqlite3.connect(db_path, timeout=0.001)
             test_conn.close()
             return False # Not locked
         except sqlite3.OperationalError:
-            st.warning(f"Database file '{db_path}' found locked on startup. Deleting it to ensure a fresh, clean process.")
+            # If a lock is detected, try to delete the file
             try:
                 os.remove(db_path)
-                st.toast("Locked database file successfully removed.")
+                st.toast("Locked database file successfully removed for fresh start.")
                 return True
             except Exception as file_error:
-                st.error(f"Could not remove locked database file. Error: {file_error}")
+                # If removal fails (e.g., file is actively open), just report the error
+                st.warning(f"Database file '{db_path}' is locked and could not be removed: {file_error}")
                 return False
         except Exception:
             return False
@@ -39,11 +40,11 @@ def clean_locked_db(db_path):
 # Aggressively try to clean the file at startup before anything else runs
 clean_locked_db(DB_NAME)
 
-# --- Database Management Class (The Guarantee) ---
+# --- Database Management Class (Maximum Resilience) ---
 class DBManager:
     """
     Manages the SQLite connection and enforces thread safety using a Lock.
-    Includes aggressive retry logic for startup to handle race conditions.
+    Includes aggressive retry logic for startup and a 60-second connection timeout.
     """
     def __init__(self, db_path):
         self.db_path = db_path
@@ -53,9 +54,9 @@ class DBManager:
 
     def _get_connection(self):
         """Creates or returns the connection, ensuring only one connection exists."""
-        # Use a longer timeout (30s) and set check_same_thread=False
-        # This connection is the one instance for the entire app lifetime
-        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+        # CRITICAL FIX: Set connection timeout to 60 seconds (up from 30) 
+        # to aggressively wait out any startup locks.
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=60)
         conn.row_factory = sqlite3.Row # Ensure we can access columns by name
         return conn
 
@@ -69,12 +70,12 @@ class DBManager:
                 self._initialize_db()
                 return # Success
             except sqlite3.OperationalError as e:
-                if 'database is locked' in str(e):
+                if 'database is locked' in str(e) or 'timeout' in str(e):
                     if attempt < MAX_RETRIES - 1:
                         st.warning(f"Database locked during initialization. Retrying in {RETRY_DELAY_SEC}s... (Attempt {attempt + 1}/{MAX_RETRIES})")
                         time.sleep(RETRY_DELAY_SEC)
                     else:
-                        st.error("Failed to initialize database after multiple retries. The app cannot start.")
+                        st.error("CRITICAL: Failed to initialize database after multiple retries. The application cannot start.")
                         # This re-raises the error if all attempts fail
                         raise e
                 else:
@@ -145,7 +146,7 @@ class DBManager:
             conn.commit()
 
         # 3. Add initial product data (Idempotent check)
-        # This is the line that keeps crashing due to locks. It is now protected by _initialize_db_with_retry.
+        # This is the line that keeps crashing, now protected by the aggressive retry/timeout mechanism.
         c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
         if c.fetchone() is None:
             c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
@@ -219,7 +220,8 @@ def verify_user(username, password):
             return users[0]['password_hash'] == hash_password(password)
         return False
     except Exception as e:
-        # st.error(f"Error verifying user: {e}") # Suppress for cleaner UI
+        # Suppress for cleaner UI, only log if needed
+        # st.error(f"Error verifying user: {e}") 
         return False
 
 def add_user(username, password):
@@ -245,7 +247,8 @@ def get_product_details(product_id):
             # Accessing columns by name using the set row_factory
             return {'product_id': row['product_id'], 'name': row['name'], 'description': row['description'], 'price': row['price'], 'stock': row['stock']}
     except Exception as e:
-        # st.error(f"Error accessing product details: {e}. Try refreshing.") # Suppress for cleaner UI
+        # Suppress for cleaner UI, only log if needed
+        # st.error(f"Error accessing product details: {e}. Try refreshing.")
         return None
     return None
 
@@ -338,8 +341,7 @@ def product_page():
 
     product = get_product_details(PRODUCT_ID)
     if not product:
-        st.error("Product details are currently unavailable.")
-        # If product details are missing, show a message and stop rendering this page
+        st.error("Product details are currently unavailable. The database may still be initializing. Please refresh.")
         return
 
     st.subheader(product['name'])
