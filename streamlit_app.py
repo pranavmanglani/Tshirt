@@ -3,12 +3,15 @@ import sqlite3
 import pandas as pd
 import hashlib
 import random
-import time 
-
-# i love cheri cheri lady
+import time
+import base64
+from io import BytesIO
+from datetime import date
+import sys 
 
 # --- CONFIGURATION & UTILITIES ---
 
+# Set page configuration at the very start
 st.set_page_config(
     page_title="T-Shirt Inventory System",
     layout="wide",
@@ -21,28 +24,27 @@ st.session_state.setdefault('username', None)
 st.session_state.setdefault('role', None)
 
 # States for complex navigation and features
-st.session_state.setdefault('current_view', 'catalog') # 'catalog', 'detail', 'profile'
+st.session_state.setdefault('current_view', 'catalog') # 'catalog', 'detail', 'profile', 'admin_products', 'admin_inventory', 'admin_performance'
 st.session_state.setdefault('selected_product_id', None)
-st.session_state.setdefault('checkout_stage', 'catalog') # 'catalog' or 'payment'
-st.session_state.setdefault('checkout_substage', None) # 'payment_form' or 'delivered'
+st.session_state.setdefault('checkout_stage', 'catalog') 
+st.session_state.setdefault('checkout_substage', None)
 st.session_state.setdefault('coupon_code', None)
-st.session_state.setdefault('discount_rate', 0.0) # 0.0 to 1.0
+st.session_state.setdefault('discount_rate', 0.0) 
 
 # Optimization Counters for Cache Invalidation
 st.session_state.setdefault('product_version', 0)
+st.session_state.setdefault('inventory_version', 0) # New cache key for inventory changes
 st.session_state.setdefault('cart_version', 0)
+st.session_state.setdefault('order_version', 0) # New cache key for sales tracking
 
 @st.cache_resource
 def get_db_connection():
     """
     Establishes and returns a single, cached connection to the SQLite database.
-    
-    CRITICAL FIX: Added a 5-second timeout and disabled same-thread check to handle 
-    Streamlit's multi-threading/re-running, resolving 'Database is locked' 
-    and 'ProgrammingError: SQLite objects created in a thread...' errors.
+    Crucially, using check_same_thread=False to handle Streamlit's threading 
+    model where functions are run in different threads.
     """
-    # This line contains the necessary fix for Streamlit database concurrency issues.
-    conn = sqlite3.connect('inventory.db', check_same_thread=False, timeout=5)
+    conn = sqlite3.connect('inventory.db', check_same_thread=False, timeout=10) # Increased timeout
     conn.row_factory = sqlite3.Row 
     return conn
 
@@ -50,90 +52,146 @@ def hash_password(password):
     """Hashes the password for secure storage."""
     return hashlib.sha256(password.encode()).hexdigest()
 
+def image_to_base64(uploaded_file):
+    """Converts uploaded file buffer to a Base64 string for database storage."""
+    if uploaded_file is None:
+        return None
+    # Read image as bytes, encode to base64, then decode to string
+    uploaded_file.seek(0) # Ensure we read from the start
+    return base64.b64encode(uploaded_file.read()).decode('utf-8')
+
+def b64_to_image_html(b64_string, width=150):
+    """Generates HTML/Markdown to display a Base64 image."""
+    if not b64_string:
+        return f'<img src="https://placehold.co/{width}x{width}/93A3BC/FFFFFF?text=No+Image" width="{width}" style="border-radius: 8px; object-fit: cover; aspect-ratio: 1/1;">'
+    return f'<img src="data:image/png;base64,{b64_string}" width="{width}" style="border-radius: 8px; object-fit: cover; aspect-ratio: 1/1;">'
+
 def init_db():
-    """Initializes database tables and safely populates initial data."""
+    """
+    Initializes database tables and populates initial data.
+    Includes robust retry logic for database locking issues.
+    """
     conn = get_db_connection()
     c = conn.cursor()
+    max_retries = 5
+    
+    # Execute DDL/Schema changes (can sometimes lock the DB briefly)
+    try:
+        c.executescript('''
+            CREATE TABLE IF NOT EXISTS USERS (
+                username TEXT PRIMARY KEY,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL,
+                profile_picture_b64 TEXT,
+                birthday TEXT
+            );
+            CREATE TABLE IF NOT EXISTS PRODUCTS (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                category TEXT NOT NULL,
+                description TEXT,
+                base_image_b64 TEXT
+            );
+            CREATE TABLE IF NOT EXISTS INVENTORY (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                size TEXT NOT NULL,
+                quantity_in_stock INTEGER NOT NULL,
+                manufacturing_cost REAL NOT NULL,
+                selling_price REAL NOT NULL,
+                FOREIGN KEY(product_id) REFERENCES PRODUCTS(id),
+                UNIQUE(product_id, size)
+            );
+            CREATE TABLE IF NOT EXISTS CART (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                inventory_id INTEGER NOT NULL,
+                quantity INTEGER NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES USERS(username),
+                FOREIGN KEY(inventory_id) REFERENCES INVENTORY(id),
+                UNIQUE(user_id, inventory_id)
+            );
+            CREATE TABLE IF NOT EXISTS ORDERS (
+                order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                total_amount REAL NOT NULL,
+                tracking_id TEXT NOT NULL,
+                order_date TEXT NOT NULL,
+                shipping_address TEXT,
+                discount_rate REAL NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES USERS(username)
+            );
+            CREATE TABLE IF NOT EXISTS ORDER_ITEMS (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                inventory_id INTEGER NOT NULL,
+                quantity INTEGER NOT NULL,
+                unit_selling_price REAL NOT NULL,
+                unit_manufacturing_cost REAL NOT NULL,
+                FOREIGN KEY(order_id) REFERENCES ORDERS(order_id),
+                FOREIGN KEY(inventory_id) REFERENCES INVENTORY(id)
+            );
+        ''')
+        conn.commit()
+    except sqlite3.OperationalError as e:
+        st.error(f"Error initializing DB schema: {e}")
+        # Cannot proceed if schema fails
 
-    # Define all necessary tables
-    c.executescript('''
-        CREATE TABLE IF NOT EXISTS USERS (
-            username TEXT PRIMARY KEY,
-            password TEXT NOT NULL,
-            role TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS PRODUCTS (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            price REAL NOT NULL,
-            size TEXT NOT NULL,
-            image_url TEXT
-        );
-        CREATE TABLE IF NOT EXISTS CART (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            product_id INTEGER NOT NULL,
-            quantity INTEGER NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES USERS(username),
-            FOREIGN KEY(product_id) REFERENCES PRODUCTS(id),
-            UNIQUE(user_id, product_id)
-        );
-        CREATE TABLE IF NOT EXISTS ORDERS (
-            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            total_amount REAL NOT NULL,
-            tracking_id TEXT NOT NULL,
-            order_date TEXT NOT NULL,
-            shipping_address TEXT,
-            FOREIGN KEY(user_id) REFERENCES USERS(username)
-        );
-    ''')
-    conn.commit() # Commit table creation immediately
-
-    # --- SAFE INITIAL DATA INSERTION ---
-    # This block handles the OperationalError (database is locked) during Streamlit restarts
-    max_retries = 3
+    # --- SAFE INITIAL DATA INSERTION WITH RETRY ---
     for attempt in range(max_retries):
         try:
-            # 1. Add initial users
-            try:
-                c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('adminpass'), 'admin'))
-                c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('custpass'), 'customer'))
-                conn.commit()
-            except sqlite3.IntegrityError: 
-                pass # User already exists, safe to ignore
-
-            # 2. Add initial products
-            initial_products = [
-                ("Classic Navy Tee", 24.99, "M", "https://placehold.co/150x150/1C3144/FFFFFF?text=Navy+Tee"),
-                ("Summer V-Neck", 19.50, "S", "https://placehold.co/150x150/FFCC00/000000?text=Yellow+V-Neck"),
-                ("Oversized Black Hoodie", 49.99, "L", "https://placehold.co/150x150/000000/FFFFFF?text=Black+Hoodie"),
-                ("Striped Casual Shirt", 35.00, "XL", "https://placehold.co/150x150/93A3BC/FFFFFF?text=Striped+Shirt"),
-            ]
-            for name, price, size, url in initial_products:
-                try:
-                    c.execute("SELECT id FROM PRODUCTS WHERE name = ? AND size = ?", (name, size))
-                    if c.fetchone() is None:
-                        c.execute("INSERT INTO PRODUCTS (name, price, size, image_url) VALUES (?, ?, ?, ?)", (name, price, size, url))
-                        conn.commit()
-                except sqlite3.IntegrityError: 
-                    pass # Product already exists, safe to ignore
+            # Add initial users (using INSERT OR IGNORE)
+            c.execute("INSERT OR IGNORE INTO USERS (username, password, role) VALUES (?, ?, ?)", ('admin', hash_password('adminpass'), 'admin'))
+            c.execute("INSERT OR IGNORE INTO USERS (username, password, role) VALUES (?, ?, ?)", ('customer1', hash_password('custpass'), 'customer'))
+            conn.commit()
             
-            # If we reach here, the insertion succeeded without a lock error. Break out of the retry loop.
-            break
+            # Add initial products (using INSERT OR IGNORE)
+            initial_products_data = [
+                ("Classic Navy Tee", "T-Shirt", "A basic, comfortable navy tee, perfect for everyday wear.", None),
+                ("Summer V-Neck", "T-Shirt", "Lightweight yellow V-neck, great for hot weather.", None),
+            ]
+            for name, category, desc, b64_img in initial_products_data:
+                c.execute("INSERT OR IGNORE INTO PRODUCTS (name, category, description, base_image_b64) VALUES (?, ?, ?, ?)", 
+                          (name, category, desc, b64_img))
+            conn.commit()
+            
+            # Now, add inventory items using the newly created product IDs
+            product1 = c.execute("SELECT id FROM PRODUCTS WHERE name = 'Classic Navy Tee'").fetchone()
+            product2 = c.execute("SELECT id FROM PRODUCTS WHERE name = 'Summer V-Neck'").fetchone()
 
+            if product1 and product2:
+                product1_id = product1[0]
+                product2_id = product2[0]
+                
+                inventory1_data = [
+                    (product1_id, "S", 50, 100.00, 249.99), # product_id, size, stock, cost, price
+                    (product1_id, "M", 100, 100.00, 249.99),
+                    (product1_id, "L", 75, 105.00, 269.99),
+                ]
+                inventory2_data = [
+                    (product2_id, "S", 25, 90.00, 199.50),
+                    (product2_id, "M", 40, 95.00, 219.50),
+                ]
+                
+                for pid, size, stock, cost, price in inventory1_data + inventory2_data:
+                    # Use INSERT OR IGNORE which is safer in concurrent environments
+                    c.execute("""
+                        INSERT OR IGNORE INTO INVENTORY (product_id, size, quantity_in_stock, manufacturing_cost, selling_price) 
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (pid, size, stock, cost, price))
+                
+                conn.commit()
+
+            break # Exit loop on success
         except sqlite3.OperationalError as e:
             if "database is locked" in str(e):
                 if attempt < max_retries - 1:
-                    # Wait and retry if locked
-                    time.sleep(0.5)
-                else:
-                    # If max retries reached, raise the error
-                    st.error(f"Failed to initialize database after {max_retries} attempts: Database is locked.")
+                    time.sleep(0.5 * (2 ** attempt)) # Exponential backoff
+                else: 
+                    st.error("Database initialization failed after multiple retries. The database is locked. Please try refreshing the app.")
                     raise
-            else:
-                # Re-raise any other unexpected operational error
-                raise
+            else: 
+                raise # Re-raise other operational errors
 
 # --- AUTHENTICATION & SESSION ---
 
@@ -142,6 +200,7 @@ def authenticate(username, password):
     conn = get_db_connection()
     c = conn.cursor()
     hashed_password = hash_password(password)
+    # Use tuple for params to prevent injection
     c.execute("SELECT role FROM USERS WHERE username = ? AND password = ?", (username, hashed_password))
     user = c.fetchone()
     return user[0] if user else None
@@ -151,7 +210,9 @@ def sign_up_user(username, password):
     conn = get_db_connection()
     c = conn.cursor()
     try:
-        c.execute("INSERT INTO USERS VALUES (?, ?, ?)", (username, hash_password(password), 'customer'))
+        # Insert new user with default null values for new fields
+        c.execute("INSERT INTO USERS (username, password, role, profile_picture_b64, birthday) VALUES (?, ?, ?, NULL, NULL)", 
+                  (username, hash_password(password), 'customer'))
         conn.commit()
         return "Success"
     except sqlite3.IntegrityError:
@@ -160,374 +221,595 @@ def sign_up_user(username, password):
         return f"Database error: {e}"
 
 def logout():
-    """Logs out the user and resets all session states."""
+    """Clears session state and logs out the user."""
     st.session_state.logged_in = False
-    st.session_state.username = st.session_state.role = None
+    st.session_state.username = None
+    st.session_state.role = None
     st.session_state.current_view = 'catalog'
     st.session_state.checkout_stage = 'catalog'
-    st.session_state.checkout_substage = None
     st.session_state.coupon_code = None
     st.session_state.discount_rate = 0.0
-    st.info("You have been logged out.")
+    # Must use st.rerun() in Streamlit for navigation/state changes
     st.rerun()
 
 def auth_forms():
-    """Displays the login and sign up forms using tabs."""
-    tab_login, tab_signup = st.tabs(["Login", "Sign Up"])
-
-    with tab_login:
-        st.subheader("Existing User Login")
-        with st.form("login_form", clear_on_submit=False): 
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            if st.form_submit_button("Login"):
-                role = authenticate(username, password)
+    """Handles login and signup forms."""
+    if not st.session_state.logged_in:
+        st.subheader("Login")
+        with st.form("login_form"):
+            login_username = st.text_input("Username (e.g., admin or customer1)")
+            login_password = st.text_input("Password (e.g., adminpass or custpass)", type="password")
+            if st.form_submit_button("Log In", use_container_width=True, type="primary"):
+                role = authenticate(login_username, login_password)
                 if role:
                     st.session_state.logged_in = True
-                    st.session_state.username = username
+                    st.session_state.username = login_username
                     st.session_state.role = role
-                    st.success(f"Welcome, {username}! Logged in as {role.capitalize()}.")
+                    st.session_state.current_view = 'catalog' # Reset view on login
                     st.rerun()
-                else: st.error("Invalid username or password.")
-    
-    with tab_signup:
-        st.subheader("New Customer Sign Up")
-        with st.form("signup_form", clear_on_submit=True):
-            new_username = st.text_input("Choose Username")
-            new_password = st.text_input("Choose Password", type="password")
-            confirm_password = st.text_input("Confirm Password", type="password")
-            if st.form_submit_button("Create Account"):
-                if new_password != confirm_password: st.error("Passwords do not match.")
-                elif len(new_username) < 4 or len(new_password) < 6: st.error("Username must be at least 4 characters and password at least 6 characters.")
                 else:
-                    result = sign_up_user(new_username, new_password)
-                    if result == "Success": st.success("Account created successfully! Please log in.")
-                    else: st.error(result)
+                    st.error("Invalid username or password.")
+        
+        st.markdown("---")
+        st.subheader("Sign Up")
+        with st.form("signup_form"):
+            signup_username = st.text_input("New Username")
+            signup_password = st.text_input("New Password", type="password")
+            if st.form_submit_button("Create Customer Account", use_container_width=True):
+                if len(signup_username) < 4 or len(signup_password) < 6:
+                    st.warning("Username must be at least 4 characters and password 6 characters.")
+                else:
+                    result = sign_up_user(signup_username, signup_password)
+                    if result == "Success":
+                        st.success("Account created! You can now log in.")
+                    else:
+                        st.error(result)
 
-# --- ADMIN FEATURES (CRUD) ---
+# --- ADMIN FEATURES (CRUD & Performance) ---
 
-def admin_add_product():
-    """Form to add a new product."""
-    st.markdown("### 👕 Add New T-Shirt Product")
-    with st.form("add_product_form"):
-        name = st.text_input("Product Name")
-        # CHANGED: Replaced $ with ₹ in the label
-        price = st.number_input("Price (₹)", min_value=0.01, format="%.2f")
-        size = st.selectbox("Size", ["XS", "S", "M", "L", "XL", "XXL"])
-        image_url = st.text_input("Image URL (e.g., placeholder)")
-        if st.form_submit_button("Add Product"):
-            if not name or not image_url: st.error("Please fill in all fields.")
-            else:
-                conn = get_db_connection()
-                try:
-                    conn.execute("INSERT INTO PRODUCTS VALUES (NULL, ?, ?, ?, ?)", (name, price, size, image_url))
-                    conn.commit()
-                    # CRITICAL: Increment product_version to bust the inventory cache
-                    st.session_state.product_version += 1
-                    st.success(f"Product '{name}' added successfully! (v{st.session_state.product_version})")
-                except Exception as e: st.error(f"Error adding product: {e}")
-
-@st.cache_data(show_spinner="Loading inventory...")
-def admin_view_inventory(product_version):
-    """Displays the current product inventory, cached."""
+@st.cache_data(show_spinner="Loading products...")
+def admin_get_products(product_version):
+    """Fetches product templates and inventory summary."""
     conn = get_db_connection()
-    df = pd.read_sql_query("SELECT id, name, price, size, image_url FROM PRODUCTS", conn)
-    return df
-
-def display_admin_inventory():
-    """Wrapper function to display inventory using cached data."""
-    st.markdown("### 📦 Current Inventory")
-    # Inventory data is dependent on the product_version counter
-    df = admin_view_inventory(st.session_state.product_version)
-    
-    if df.empty: st.info("The inventory is currently empty.")
-    else: 
-        # CHANGED: Replaced $ with ₹ in column configuration
-        st.dataframe(df, column_config={"price": st.column_config.NumberColumn("Price (₹)", format="₹%.2f")}, hide_index=True)
-
-
-# --- CUSTOMER FEATURES ---
-
-@st.cache_data(show_spinner="Loading cart...")
-def get_user_cart(user_id, cart_version):
-    """Retrieves the user's current cart items, cached by user_id and cart_version."""
-    conn = get_db_connection()
-    query = f"""
-    SELECT T1.id AS cart_item_id, T2.id AS product_id, T2.name, T2.price, T1.quantity, T2.size, T2.image_url
-    FROM CART AS T1 JOIN PRODUCTS AS T2 ON T1.product_id = T2.id
-    WHERE T1.user_id = '{user_id}'
+    query = """
+    SELECT 
+        P.id, P.name, P.category, P.description, P.base_image_b64,
+        COUNT(I.id) AS unique_sizes,
+        IFNULL(SUM(I.quantity_in_stock), 0) AS total_stock,
+        MIN(I.selling_price) AS min_price,
+        MAX(I.selling_price) AS max_price
+    FROM PRODUCTS AS P
+    LEFT JOIN INVENTORY AS I ON P.id = I.product_id
+    GROUP BY P.id
+    ORDER BY P.id DESC
     """
     df = pd.read_sql_query(query, conn)
     return df
 
-def add_to_cart(product_id, quantity):
-    """Adds or updates a product in the user's cart."""
+@st.cache_data(show_spinner="Loading inventory details...")
+def admin_get_inventory_details(product_id, inventory_version):
+    """Fetches detailed inventory for a single product template."""
+    conn = get_db_connection()
+    query = """
+    SELECT id, size, quantity_in_stock, manufacturing_cost, selling_price
+    FROM INVENTORY
+    WHERE product_id = ?
+    ORDER BY size
+    """
+    df = pd.read_sql_query(query, conn, params=(product_id,))
+    return df
+
+def admin_add_product_template():
+    """Form to add a new top-level product template (name, description, image)."""
+    st.markdown("### 👕 1. Add New Product Template (Name, Description, Image)")
+    with st.form("add_product_template_form", clear_on_submit=True):
+        name = st.text_input("Product Name", key="new_product_name")
+        category = st.selectbox("Category", ["T-Shirt", "Shirt", "Hoodie", "Accessory", "Other"], key="new_product_category")
+        description = st.text_area("Description", key="new_product_description")
+        
+        # FEATURE 1: Image Upload
+        uploaded_file = st.file_uploader("Upload Product Image (PNG/JPG)", type=["png", "jpg", "jpeg"], key="new_product_image_uploader")
+        
+        if st.form_submit_button("Create Product Template", type="primary", use_container_width=True):
+            if not name or not category or not description:
+                st.error("Please fill in the Name, Category, and Description.")
+            else:
+                b64_image = image_to_base64(uploaded_file)
+                conn = get_db_connection()
+                try:
+                    conn.execute("INSERT INTO PRODUCTS (name, category, description, base_image_b64) VALUES (?, ?, ?, ?)", 
+                                 (name, category, description, b64_image))
+                    conn.commit()
+                    st.session_state.product_version += 1
+                    st.success(f"Product Template '{name}' created successfully! Now add inventory for sizes/costs.")
+                    st.rerun() # Rerun to refresh the product list immediately
+                except sqlite3.IntegrityError:
+                    st.error(f"Product name '{name}' already exists.")
+                except Exception as e: 
+                    st.error(f"Error adding product: {e}")
+
+def admin_add_inventory_item(product_id):
+    """Form to add or update stock for a specific size/cost/price for a product template."""
+    conn = get_db_connection()
+    product_row = conn.execute("SELECT name FROM PRODUCTS WHERE id = ?", (product_id,)).fetchone()
+    if not product_row: return
+    product_name = product_row[0]
+    
+    st.markdown(f"### 📦 2. Manage Inventory for: {product_name}")
+    
+    current_inventory_df = admin_get_inventory_details(product_id, st.session_state.inventory_version)
+    
+    st.markdown("#### Existing Stock & Pricing")
+    if current_inventory_df.empty:
+        st.info("No sizes/stock added yet for this product.")
+    else:
+        # FEATURE 4: Displaying Inventory Details (including cost/price)
+        st.dataframe(
+            current_inventory_df, 
+            column_config={
+                "quantity_in_stock": "Stock",
+                "manufacturing_cost": st.column_config.NumberColumn("Man. Cost (₹)", format="₹%.2f"),
+                "selling_price": st.column_config.NumberColumn("Sell Price (₹)", format="₹%.2f"),
+                "id": None,
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+
+    st.markdown("---")
+    st.markdown("#### Add/Update Size Stock and Pricing")
+    with st.form(f"add_inventory_form_{product_id}", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1: 
+            size = st.selectbox("Size", ["XS", "S", "M", "L", "XL", "XXL"], key=f"inv_size_{product_id}")
+            # FEATURE 7: Manufacturing Cost
+            cost = st.number_input("Manufacturing Cost (₹)", min_value=0.01, format="%.2f", key=f"inv_cost_{product_id}", value=150.00)
+        
+        with col2:
+            # FEATURE 2: Bulk Quantity in Stock
+            quantity = st.number_input("Bulk Quantity to Add/Set", min_value=1, value=10, step=1, key=f"inv_qty_{product_id}")
+            # FEATURE 7: Selling Price (Customer Price)
+            price = st.number_input("Selling Price (₹)", min_value=0.01, format="%.2f", key=f"inv_price_{product_id}", value=399.00)
+        
+        action = st.radio("Action for existing size", ["Set Stock to Quantity", "Add to Current Stock"], horizontal=True, index=0)
+
+        if st.form_submit_button("Save Inventory Item", type="primary", use_container_width=True):
+            if price <= cost:
+                st.error("Selling Price must be higher than Manufacturing Cost to ensure profit margin.")
+            else:
+                try:
+                    # Check if inventory item for this size already exists
+                    existing_item = conn.execute("SELECT id, quantity_in_stock FROM INVENTORY WHERE product_id = ? AND size = ?", 
+                                                (product_id, size)).fetchone()
+                    
+                    if existing_item:
+                        inventory_id, current_stock = existing_item
+                        
+                        if action == "Add to Current Stock":
+                            new_stock = current_stock + quantity
+                        else: # "Set Stock to Quantity"
+                            new_stock = quantity
+                            
+                        # Update existing item
+                        conn.execute("UPDATE INVENTORY SET quantity_in_stock = ?, manufacturing_cost = ?, selling_price = ? WHERE id = ?",
+                                    (new_stock, cost, price, inventory_id))
+                        st.success(f"Updated {size} stock to {new_stock}. Price: ₹{price:.2f}, Cost: ₹{cost:.2f}")
+                    else:
+                        # Insert new item
+                        conn.execute("INSERT INTO INVENTORY VALUES (NULL, ?, ?, ?, ?, ?)", 
+                                    (product_id, size, quantity, cost, price))
+                        st.success(f"Added new size {size} with {quantity} in stock. Price: ₹{price:.2f}, Cost: ₹{cost:.2f}")
+                    
+                    conn.commit()
+                    st.session_state.inventory_version += 1
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error managing inventory: {e}")
+
+def admin_performance_tracking():
+    """FEATURE 5 & 7: Displays sales, revenue, cost, and profit/loss over time."""
+    st.title("📈 Performance Tracking Dashboard (Admin Only)")
+    
+    conn = get_db_connection()
+    # Ensure that the latest data is fetched using the version number
+    # (The cache key is handled by the function call, but we include it here to ensure completeness)
+    order_version = st.session_state.order_version 
+    
+    query = """
+    SELECT 
+        O.order_date,
+        OI.quantity,
+        OI.unit_selling_price,
+        OI.unit_manufacturing_cost
+    FROM ORDERS AS O
+    JOIN ORDER_ITEMS AS OI ON O.order_id = OI.order_id
+    """
+    df = pd.read_sql_query(query, conn)
+    
+    if df.empty:
+        st.info("No sales data available yet to track performance.")
+        return
+
+    # --- Calculations ---
+    df['date'] = pd.to_datetime(df['order_date']).dt.date
+    df['Revenue'] = df['quantity'] * df['unit_selling_price']
+    df['Cost'] = df['quantity'] * df['unit_manufacturing_cost']
+    df['Profit'] = df['Revenue'] - df['Cost']
+
+    total_revenue = df['Revenue'].sum()
+    total_cost = df['Cost'].sum()
+    total_profit = df['Profit'].sum()
+    margin_pct = (total_profit / total_revenue * 100) if total_revenue > 0 else 0
+
+    st.subheader("Key Financial Metrics")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Revenue", f"₹{total_revenue:,.2f}")
+    col2.metric("Total Cost", f"₹{total_cost:,.2f}")
+    col3.metric("Total Profit", f"₹{total_profit:,.2f}", delta=f"{margin_pct:.2f}% Margin")
+    col4.metric("Total Items Sold", f"{df['quantity'].sum():,}")
+
+    # --- Sales Over Time Graph (FEATURE 5) ---
+    st.subheader("Sales and Profit Trend (by Date)")
+    
+    # Aggregate data by date
+    sales_trend = df.groupby('date').agg(
+        Total_Revenue=('Revenue', 'sum'),
+        Total_Profit=('Profit', 'sum'),
+    ).reset_index()
+
+    sales_chart_data = sales_trend.set_index('date')[['Total_Revenue', 'Total_Profit']]
+    st.line_chart(sales_chart_data)
+
+# --- CUSTOMER FEATURES ---
+
+@st.cache_data(show_spinner="Loading products...")
+def get_customer_catalog(product_version):
+    """Fetches combined product and inventory data for the customer catalog."""
+    conn = get_db_connection()
+    query = """
+    SELECT 
+        P.id AS product_id, P.name, P.category, P.description, P.base_image_b64,
+        I.id AS inventory_id, I.size, I.quantity_in_stock, I.selling_price
+    FROM PRODUCTS AS P
+    JOIN INVENTORY AS I ON P.id = I.product_id
+    WHERE I.quantity_in_stock > 0
+    ORDER BY P.id DESC, I.selling_price ASC
+    """
+    df = pd.read_sql_query(query, conn)
+    return df
+
+@st.cache_data(show_spinner="Loading cart...")
+def get_user_cart(user_id, cart_version):
+    """Retrieves the user's current cart items."""
+    conn = get_db_connection()
+    # The query joins cart items with inventory and product details
+    query = """
+    SELECT 
+        C.id AS cart_item_id, C.quantity AS cart_quantity,
+        I.id AS inventory_id, I.size, I.selling_price, 
+        P.name, P.base_image_b64
+    FROM CART AS C 
+    JOIN INVENTORY AS I ON C.inventory_id = I.id
+    JOIN PRODUCTS AS P ON I.product_id = P.id
+    WHERE C.user_id = ?
+    """
+    df = pd.read_sql_query(query, conn, params=(user_id,))
+    return df
+
+def add_to_cart(inventory_id, quantity):
+    """Adds or updates a product size/inventory item in the user's cart."""
     user_id = st.session_state.username
     conn = get_db_connection()
     c = conn.cursor()
+    
+    # Check if stock is sufficient
+    stock_check = c.execute("SELECT quantity_in_stock FROM INVENTORY WHERE id = ?", (inventory_id,)).fetchone()
+    if not stock_check:
+        st.error("Invalid product selection.")
+        return
+        
+    available_stock = stock_check[0]
+
     try:
-        # Check if the exact product ID is already in the cart
-        c.execute("SELECT quantity FROM CART WHERE user_id = ? AND product_id = ?", (user_id, product_id))
+        c.execute("SELECT quantity FROM CART WHERE user_id = ? AND inventory_id = ?", (user_id, inventory_id))
         cart_item = c.fetchone()
 
         if cart_item:
-            new_quantity = cart_item[0] + quantity
-            c.execute("UPDATE CART SET quantity = ? WHERE user_id = ? AND product_id = ?", (new_quantity, user_id, product_id))
+            current_cart_qty = cart_item[0]
+            new_quantity = current_cart_qty + quantity
+            
+            if new_quantity > available_stock:
+                st.error(f"Cannot add {quantity} more items. Only {available_stock - current_cart_qty} available in stock.")
+                return
+                
+            c.execute("UPDATE CART SET quantity = ? WHERE user_id = ? AND inventory_id = ?", (new_quantity, user_id, inventory_id))
             st.toast(f"Updated quantity to {new_quantity}!", icon="🛒")
         else:
-            c.execute("INSERT INTO CART VALUES (NULL, ?, ?, ?)", (user_id, product_id, quantity))
+            if quantity > available_stock:
+                st.error(f"Cannot add {quantity}. Only {available_stock} available in stock.")
+                return
+                
+            c.execute("INSERT INTO CART VALUES (NULL, ?, ?, ?)", (user_id, inventory_id, quantity))
             st.toast("Product added to cart!", icon="🛒")
+            
         conn.commit()
-        
-        # CRITICAL: Increment cart_version to bust the cart cache
         st.session_state.cart_version += 1
         
     except Exception as e:
         st.error(f"Could not add item: {e}")
-    st.rerun() # Rerunning is necessary for instant UI update
+    st.rerun() 
 
 def remove_from_cart(cart_item_id):
-    """Removes a single item entry from the cart based on its ID."""
+    """Removes an item from the cart."""
     conn = get_db_connection()
-    try:
-        conn.execute("DELETE FROM CART WHERE id = ?", (cart_item_id,))
-        conn.commit()
-        # CRITICAL: Increment cart_version to bust the cart cache
-        st.session_state.cart_version += 1
-        st.toast("Item removed from cart!", icon="❌")
-    except Exception as e:
-        st.error(f"Error removing item: {e}")
+    conn.execute("DELETE FROM CART WHERE id = ?", (cart_item_id,))
+    conn.commit()
+    st.session_state.cart_version += 1
+    st.toast("Item removed from cart.", icon="🗑️")
     st.rerun()
 
 def clear_user_cart(user_id):
-    """Removes all items from the user's cart."""
+    """Deletes all items from a user's cart."""
     conn = get_db_connection()
     conn.execute("DELETE FROM CART WHERE user_id = ?", (user_id,))
     conn.commit()
-    # CRITICAL: Increment cart_version to bust the cart cache
     st.session_state.cart_version += 1
 
 def spin_the_wheel_logic():
-    """Simulates a discount wheel spin and updates session state."""
-    # Define available discount codes and their corresponding rates
-    discounts = {
-        "NO-LUCK": 0.0,
-        "SAVE5": 0.05,
-        "SAVE10": 0.10,
-        "SAVE20": 0.20,
-    }
+    """FEATURE 13: Simulates a 'Spin the Wheel' discount."""
+    # Weights for random choice: Higher chance for 0%
+    options = [
+        (0.0, "Better luck next time! You won 0% discount."),
+        (0.0, "Better luck next time! You won 0% discount."),
+        (0.05, "🎉 5% off!"),
+        (0.10, "🎊 10% discount!"),
+        (0.15, "✨ 15% discount!"),
+        (0.20, "🥳 20% discount!")
+    ]
     
-    # Define weight distribution for outcomes (e.g., 50% for 0%)
-    outcomes = random.choices(
-        list(discounts.keys()), 
-        weights=[50, 30, 15, 5], 
-        k=1
-    )[0]
+    chosen_discount, message = random.choice(options)
     
-    st.session_state.coupon_code = outcomes
-    st.session_state.discount_rate = discounts[outcomes]
-    
-    if st.session_state.discount_rate > 0:
-        st.success(f"🎉 Winner! You won a {int(st.session_state.discount_rate * 100)}% discount with code **{outcomes}**!")
+    if chosen_discount > 0:
+        coupon_code = f"SPIN{int(chosen_discount*100)}{random.randint(100, 999)}"
+        st.session_state.coupon_code = coupon_code
+        st.session_state.discount_rate = chosen_discount
+        st.balloons()
+        st.success(f"{message} Coupon: `{coupon_code}`")
     else:
-        st.info("Spin again next time! No extra discount this round.")
+        st.session_state.coupon_code = "NONE"
+        st.session_state.discount_rate = 0.0
+        st.warning(message)
     
-    # Rerun to refresh the checkout summary with the new discount
-    st.session_state.checkout_substage = 'payment_form'
     st.rerun()
 
 def customer_checkout(cart_df):
-    """Handles the multi-stage fake payment and delivery process with discount logic."""
+    """Handles checkout, now deducting stock and saving detailed costs."""
     user_id = st.session_state.username
     if cart_df.empty:
-        st.error("Your cart is empty. Please add items to buy.")
-        st.session_state.checkout_stage = 'catalog'
-        st.session_state.current_view = 'catalog'
+        st.warning("Your cart is empty. Please add items to buy.")
+        if st.button("Go to Catalog", type="secondary"):
+            st.session_state.checkout_stage = 'catalog'
+            st.session_state.current_view = 'catalog'
+            st.rerun()
         return
 
     # --- STAGE 1: PAYMENT FORM ---
     if st.session_state.get('checkout_substage') != 'delivered':
-        total_pre_discount = (cart_df['price'] * cart_df['quantity']).sum()
-        total = total_pre_discount # Default total
-
+        # Rename 'cart_quantity' to 'Quantity' for display
+        cart_df['Quantity'] = cart_df['cart_quantity'] 
+        cart_df['Subtotal'] = cart_df['selling_price'] * cart_df['Quantity']
+        
+        total_pre_discount = cart_df['Subtotal'].sum()
+        
         st.subheader("1. Order Summary")
         
-        # Display cart with remove buttons
+        # Display cart with a dedicated button handler for removing items
+        
         st.dataframe(
-            cart_df[['name', 'size', 'quantity', 'price']],
-            # CHANGED: Replaced $ with ₹ in column configuration
-            column_config={"price": st.column_config.NumberColumn("Price (₹)", format="₹%.2f")},
-            hide_index=True
+            cart_df[['name', 'size', 'Quantity', 'selling_price', 'Subtotal', 'cart_item_id']],
+            column_config={
+                "selling_price": st.column_config.NumberColumn("Unit Price (₹)", format="₹%.2f"),
+                "Subtotal": st.column_config.NumberColumn("Item Total (₹)", format="₹%.2f"),
+                "cart_item_id": None, # Hide ID
+            },
+            hide_index=True,
+            use_container_width=True
         )
         
-        # Display individual remove buttons below the table
-        # We need to create a layout that supports dynamic button creation
-        st.markdown("**Remove Individual Items:**")
-        cols_remove = st.columns(3)
-        
+        # Manually create remove buttons outside the dataframe
+        st.markdown("#### Manage Cart Items")
         for index, row in cart_df.iterrows():
-            col_index = index % 3
-            cols_remove[col_index].button(
-                f"Remove 1x {row['name']} ({row['size']})", 
-                key=f"remove_{row['cart_item_id']}", 
-                on_click=remove_from_cart, 
-                args=(row['cart_item_id'],)
-            )
+            col_name, col_btn = st.columns([4, 1])
+            with col_name:
+                st.markdown(f"**{row['name']}** ({row['size']}) - Qty: {row['Quantity']}")
+            with col_btn:
+                # Use a specific key for each item's remove button
+                if st.button("Remove", key=f"remove_item_{row['cart_item_id']}", use_container_width=True):
+                    remove_from_cart(row['cart_item_id']) # Calls st.rerun() inside
 
         st.markdown("---")
         
-        # --- Discount/Coupon Wheel ---
+        # --- Discount/Coupon Wheel (FEATURE 13) ---
         st.subheader("🎁 Spin to Win a Discount!")
         
-        if st.session_state.coupon_code is None:
+        if st.session_state.coupon_code is None or st.session_state.coupon_code == "NONE":
             st.button("Spin the Discount Wheel", key="spin_wheel", type="secondary", 
                       on_click=spin_the_wheel_logic, help="Get a chance to win a discount on your order.")
         
-        # Apply Discount Logic
-        if st.session_state.discount_rate > 0:
+        total = total_pre_discount
+        if st.session_state.discount_rate > 0.0:
             discount_amount = total_pre_discount * st.session_state.discount_rate
             total_post_discount = total_pre_discount - discount_amount
-            total = total_post_discount # Use the discounted total
+            total = total_post_discount 
             
             st.markdown(f"**Coupon Applied:** `{st.session_state.coupon_code}` ({int(st.session_state.discount_rate * 100)}% off)")
-            # CHANGED: Replaced $ with ₹ in metric display
+            st.metric("Subtotal", f"₹{total_pre_discount:.2f}")
             st.metric("Discount Applied", f"- ₹{discount_amount:.2f}")
-            # CHANGED: Replaced $ with ₹ in metric display
-            st.metric("Final Payable", f"₹{total_post_discount:.2f}", delta=f"-{int(st.session_state.discount_rate * 100)}%")
+            st.metric("Final Payable", f"₹{total_post_discount:.2f}", delta=f"-{int(st.session_state.discount_rate * 100)}% Saving")
         else:
-             # CHANGED: Replaced $ with ₹ in metric display
              st.metric("Total Payable", f"₹{total_pre_discount:.2f}")
 
         st.markdown("---")
 
         st.subheader("2. 💳 Fake Payment Gateway")
         with st.form("payment_form", clear_on_submit=False):
-            st.warning("⚠️ This is a simulated payment gateway.")
+            st.warning("⚠️ This is a simulated payment gateway. Your data is not transmitted.")
             card_number = st.text_input("Card Number", value="4111 1111 1111 1111")
-            col1, col2 = st.columns(2)
-            with col1: expiry = st.text_input("Expiry Date (MM/YY)", value="12/26")
-            with col2: cvv = st.text_input("CVV", type="password", value="123")
             address = st.text_area("Shipping Address", "123 Main St, Springfield, Anystate, 12345")
             
-            if st.form_submit_button("Process Payment & Place Order", type="primary"):
+            if st.form_submit_button("Process Payment & Place Order", type="primary", use_container_width=True):
                 # Simple validation
-                if len(card_number.replace(' ', '')) != 16 or len(cvv) != 3 or not address or not expiry:
-                    st.error("Please enter valid fake payment details.")
+                if not address:
+                    st.error("Please enter a shipping address.")
                 else:
                     st.session_state.checkout_substage = 'delivered'
-                    st.session_state.order_total = total # Save the final total
+                    st.session_state.order_total = total # Store the final discounted total
                     st.session_state.shipping_address = address
                     st.rerun()
 
     # --- STAGE 2: DELIVERY SIMULATION & CONFIRMATION ---
     if st.session_state.get('checkout_substage') == 'delivered':
         
-        # Generate a unique tracking ID
         tracking_id = f"DEL-{hashlib.sha256(user_id.encode()).hexdigest()[:6].upper()}-{pd.Timestamp.now().strftime('%d%H%M')}"
-        
         conn = get_db_connection()
+        c = conn.cursor()
+        
+        # Need to re-fetch the cart one last time just before transaction for guaranteed data integrity
+        cart_df_for_order = get_user_cart(st.session_state.username, st.session_state.cart_version) 
+
         try:
-            # Save the final order details
-            conn.execute("INSERT INTO ORDERS VALUES (NULL, ?, ?, ?, ?, ?)",
-                      (user_id, st.session_state.order_total, tracking_id, str(pd.Timestamp.now()), st.session_state.shipping_address))
+            # 1. Create the Order
+            # Use stored order_total and discount_rate from session state
+            c.execute("INSERT INTO ORDERS VALUES (NULL, ?, ?, ?, ?, ?, ?)",
+                      (user_id, st.session_state.order_total, tracking_id, str(pd.Timestamp.now()), 
+                       st.session_state.shipping_address, st.session_state.discount_rate))
+            order_id = c.lastrowid
+            
+            # 2. Add Order Items, Update Stock, and Capture Costs
+            for index, row in cart_df_for_order.iterrows():
+                inventory_id = row['inventory_id']
+                quantity = row['cart_quantity'] # Use cart_quantity
+                
+                # Fetch detailed cost info and current stock from inventory
+                item_info = c.execute("SELECT manufacturing_cost, selling_price, quantity_in_stock FROM INVENTORY WHERE id = ?", (inventory_id,)).fetchone()
+                
+                if item_info and item_info[2] >= quantity:
+                    man_cost, sell_price, current_stock = item_info
+                    
+                    # Insert into ORDER_ITEMS (Captures cost at time of sale for performance tracking)
+                    c.execute("INSERT INTO ORDER_ITEMS VALUES (NULL, ?, ?, ?, ?, ?)", 
+                              (order_id, inventory_id, quantity, sell_price, man_cost))
+                    
+                    # Update INVENTORY stock (Deduct quantity)
+                    new_stock = current_stock - quantity
+                    c.execute("UPDATE INVENTORY SET quantity_in_stock = ? WHERE id = ?", (new_stock, inventory_id))
+                else:
+                    # Should not happen if stock check was done at add_to_cart, but handle failed deduction
+                    raise Exception(f"Stock check failed during final transaction for inventory item {inventory_id}. Transaction rolled back.")
+                    
+            clear_user_cart(user_id) # Clears cart
             conn.commit()
             
-            clear_user_cart(user_id) # Clears cart and increments cart_version
-            
-            # Reset discount states after successful order
+            # Reset states and increment version counters
             st.session_state.coupon_code = None
             st.session_state.discount_rate = 0.0
+            st.session_state.order_version += 1 # Trigger performance cache refresh
+            st.session_state.inventory_version += 1 # Trigger inventory views refresh
 
             st.balloons()
             st.success("🎉 Purchase Successful! Your order is placed.")
-
-            st.markdown("---")
-            st.subheader("3. 🚚 Fake Delivery Confirmation")
-            st.info("Your order is now **Processing**.")
-            
+            st.markdown(f"**Order Total:** ₹{st.session_state.order_total:.2f}")
             st.markdown(f"**Tracking ID:** `{tracking_id}`")
-            st.markdown(f"**Shipping Address:** {st.session_state.shipping_address}")
-            estimated_delivery = pd.Timestamp.now() + pd.Timedelta(days=7)
-            st.markdown(f"**Estimated Delivery:** **{estimated_delivery.strftime('%A, %B %d, %Y')}**")
-            
-            if st.button("Back to Shopping", type="secondary"):
+            st.markdown(f"**Shipping to:** {st.session_state.shipping_address}")
+
+            if st.button("Continue Shopping", type="primary"):
                 st.session_state.checkout_stage = 'catalog'
                 st.session_state.current_view = 'catalog'
                 st.session_state.checkout_substage = None
                 st.rerun()
                 
         except Exception as e:
-            st.error(f"Error saving order: {e}")
+            st.error(f"Error processing order. Please try again. Details: {e}")
+            conn.rollback()
 
-@st.cache_data(show_spinner="Loading products...")
-def get_all_products(product_version):
-    """Fetches all product data from the database, cached."""
-    conn = get_db_connection()
-    products_df = pd.read_sql_query("SELECT id, name, price, size, image_url FROM PRODUCTS", conn)
-    return products_df
-    
+
 def customer_browse_products():
-    """Displays all products, allows search, and links to detail view."""
+    """Displays all products, allows search, and filtering."""
     st.markdown("### 🛍️ Browse Our T-Shirts")
     
-    # --- Search Bar ---
-    search_query = st.text_input("🔍 Search Products", placeholder="Search by name, size, or description...", key="product_search")
+    # --- Filter/Search Controls (FEATURE 6 & 14) ---
+    col_s, col_c, col_sz = st.columns([3, 1, 1])
+    
+    with col_s: search_query = st.text_input("🔍 Search Products", placeholder="Search by name, description, or category...", key="product_search")
+    
+    # Get all unique categories and sizes currently in stock
+    products_df_all = get_customer_catalog(st.session_state.product_version)
+    
+    unique_categories = ["All Products"] + sorted(products_df_all['category'].unique().tolist())
+    unique_sizes = ["All Sizes"] + sorted(products_df_all['size'].unique().tolist())
+    
+    with col_c: selected_category = st.selectbox("Filter by Type", unique_categories, key="filter_category")
+    with col_sz: selected_size = st.selectbox("Filter by Size", unique_sizes, key="filter_size")
 
-    # Use cached data
-    products_df = get_all_products(st.session_state.product_version)
-
-    if products_df.empty: 
-        st.info("No products available.")
-        return
-        
-    # Apply filter based on search query
+    # Apply filters
+    filtered_df = products_df_all.copy()
+    if selected_category != "All Products":
+        filtered_df = filtered_df[filtered_df['category'] == selected_category]
+    if selected_size != "All Sizes":
+        filtered_df = filtered_df[filtered_df['size'] == selected_size]
+    
+    # Apply text search
     if search_query:
         query_lower = search_query.lower()
-        products_df = products_df[products_df.apply(
+        filtered_df = filtered_df[filtered_df.apply(
             lambda row: query_lower in row['name'].lower() or 
-                        query_lower in row['size'].lower(), axis=1
+                        query_lower in str(row['description']).lower() or
+                        query_lower in row['category'].lower(), axis=1
         )]
     
-    if products_df.empty and search_query:
-        st.warning(f"No products found matching '{search_query}'.")
+    if filtered_df.empty: 
+        st.warning(f"No products found matching your criteria.")
         return
         
+    # Group by Product ID to display unique items (since one product has many inventory lines)
+    product_groups = filtered_df.groupby('product_id').agg(
+        name=('name', 'first'),
+        category=('category', 'first'),
+        description=('description', 'first'),
+        base_image_b64=('base_image_b64', 'first'),
+        min_price=('selling_price', 'min'),
+    ).reset_index().sort_values(by='product_id', ascending=False)
+        
     # Display Products
-    # Use max 3 columns, or fewer if there are fewer products
-    num_products = len(products_df)
-    cols = st.columns(min(3, num_products)) 
+    num_products = len(product_groups)
+    cols = st.columns(min(4, num_products) or 1) # Ensure at least 1 column for display
 
-    if num_products == 0: return
-
-    for index, row in products_df.iterrows():
-        # Cycle through columns: 0, 1, 2, 0, 1, 2...
-        col_index = index % min(3, len(cols))
+    for index, row in product_groups.iterrows():
+        col_index = index % min(4, len(cols))
         col = cols[col_index]
         
         with col.container(border=True):
-            st.image(row['image_url'], caption=row['name'], width=150)
+            # FEATURE 4: Display uploaded image
+            col.markdown(b64_to_image_html(row['base_image_b64'], width=200), unsafe_allow_html=True)
             st.markdown(f"**{row['name']}**")
-            # CHANGED: Replaced $ with ₹ in price display
-            st.markdown(f"**Price:** ₹{row['price']:.2f} | **Size:** {row['size']}")
+            st.markdown(f"*{row['category']}*")
+            st.markdown(f"**Price from:** ₹{row['min_price']:.2f}")
             
-            # Button to navigate to Product Detail View
-            if col.button("View Details", key=f"view_detail_{row['id']}"):
-                st.session_state.selected_product_id = row['id']
+            if col.button("View Details", key=f"view_detail_{row['product_id']}", use_container_width=True):
+                st.session_state.selected_product_id = row['product_id']
                 st.session_state.current_view = 'detail'
                 st.rerun()
 
 def product_detail_view():
-    """Displays single product details and allows adding to cart."""
+    """Displays single product details, description, size chart, and allows size selection (FEATURE 8, 9, 10, 11)."""
     product_id = st.session_state.selected_product_id
     if not product_id:
-        st.error("No product selected.")
         st.session_state.current_view = 'catalog'
         return
 
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT * FROM PRODUCTS WHERE id = ?", (product_id,))
-    product_row = c.fetchone()
+    product_row = c.execute("SELECT * FROM PRODUCTS WHERE id = ?", (product_id,)).fetchone()
     
     if not product_row:
         st.error("Product not found.")
@@ -535,165 +817,309 @@ def product_detail_view():
         return
         
     product = dict(product_row)
+    
+    # FEATURE 11: Back to catalog button on top left
+    if st.button("⬅️ Back to Catalog", key="back_from_detail_top"):
+        st.session_state.selected_product_id = None
+        st.session_state.current_view = 'catalog'
+        st.rerun()
 
-    st.title(f"✨ {product['name']} Details")
+    st.title(f"✨ {product['name']}")
+    st.markdown(f"**Category:** *{product['category']}*")
 
     col_img, col_info = st.columns([1, 2])
     
     with col_img:
-        st.image(product['image_url'], caption=product['name'], use_column_width=True)
+        # FEATURE 4: Display uploaded image
+        st.markdown(b64_to_image_html(product['base_image_b64'], width=350), unsafe_allow_html=True)
 
     with col_info:
-        # CHANGED: Replaced $ with ₹ in metric display
-        st.metric("Price", f"₹{product['price']:.2f}")
-        st.markdown(f"**Description:** High-quality T-shirt made from organic cotton.")
+        # FEATURE 9: Seeing a description below
+        st.subheader("Product Description")
+        st.info(product['description'])
+
+        # --- Size Selection and Add to Cart (FEATURE 8) ---
+        st.subheader("Select Size & Quantity")
         
-        # Allow selection of quantity
-        quantity = st.number_input("Quantity", min_value=1, value=1, step=1, key="detail_qty")
+        inventory_df = admin_get_inventory_details(product_id, st.session_state.inventory_version)
+        available_stock = inventory_df[inventory_df['quantity_in_stock'] > 0]
+        
+        if available_stock.empty:
+            st.error("This product is currently out of stock.")
+            return
+
+        # Map inventory ID to a display string
+        inventory_map = {}
+        for _, row in available_stock.iterrows():
+             # Only show price and stock for items that have stock
+            if row['quantity_in_stock'] > 0:
+                key = f"{row['size']} (₹{row['selling_price']:.2f}) - Stock: {row['quantity_in_stock']}"
+                inventory_map[key] = row['id']
+                
+        size_options = list(inventory_map.keys())
+        
+        selected_option = st.selectbox("Select Size & Price", size_options, key="size_select")
+        selected_inventory_id = inventory_map[selected_option]
+
+        # Get max quantity for selected item
+        selected_inventory_row = available_stock[available_stock['id'] == selected_inventory_id].iloc[0]
+        max_qty = selected_inventory_row['quantity_in_stock']
+        
+        st.metric("Current Price", f"₹{selected_inventory_row['selling_price']:.2f}")
+
+        quantity = st.number_input(f"Quantity (Max {max_qty})", min_value=1, max_value=max_qty, value=1, step=1, key="detail_qty")
         
         st.markdown("---")
         
-        if st.button(f"Add {quantity}x to Cart", type="primary", key="add_to_cart_detail"):
-            add_to_cart(product['id'], quantity)
-            st.session_state.selected_product_id = None # Clear selection
-            st.session_state.current_view = 'catalog' # Go back to catalog
-            # add_to_cart already calls rerun
-        
-        if st.button("Back to Catalog", key="back_from_detail"):
-            st.session_state.selected_product_id = None
-            st.session_state.current_view = 'catalog'
-            st.rerun()
+        if st.button("Add to Cart", type="primary", key="add_to_cart_detail", use_container_width=True):
+            add_to_cart(selected_inventory_id, quantity)
+            # Rerun happens inside add_to_cart
+
+    # FEATURE 10: Size Chart
+    st.markdown("---")
+    st.subheader("📏 Size Chart")
+    size_chart_data = {
+        'Size': ['XS', 'S', 'M', 'L', 'XL', 'XXL'],
+        'Chest (in)': ['32-34', '36-38', '40-42', '44-46', '48-50', '52-54'],
+        'Length (in)': ['24', '26', '28', '30', '32', '34']
+    }
+    st.dataframe(pd.DataFrame(size_chart_data), hide_index=True, use_container_width=True)
 
 
-@st.cache_data(show_spinner="Loading order history...")
-def get_order_history(user_id):
-    """Fetches user order history, cached by user_id."""
+@st.cache_data(show_spinner="Loading user data...")
+def get_user_data(user_id):
+    """Fetches user profile data."""
     conn = get_db_connection()
-    order_history_df = pd.read_sql_query(
-        "SELECT order_id, total_amount, tracking_id, order_date FROM ORDERS WHERE user_id = ? ORDER BY order_date DESC", 
-        conn, 
-        params=(user_id,)
-    )
-    return order_history_df
+    user_data = conn.execute("SELECT profile_picture_b64, birthday FROM USERS WHERE username = ?", (user_id,)).fetchone()
+    return dict(user_data) if user_data else {}
 
 def user_profile_view():
-    """Displays user information and order history."""
+    """Displays user information, allows editing profile picture and birthday (FEATURE 12)."""
     user_id = st.session_state.username
     st.title(f"👤 User Profile: {user_id}")
     
-    st.subheader("Account Details")
-    st.markdown(f"**Username:** `{user_id}`")
-    st.markdown(f"**Role:** `{st.session_state.role.capitalize()}`")
+    current_data = get_user_data(user_id)
+    
+    col_pic, col_info = st.columns([1, 2])
+    
+    with col_pic:
+        st.subheader("Profile Picture")
+        # Display current picture
+        st.markdown(b64_to_image_html(current_data.get('profile_picture_b64'), width=180), unsafe_allow_html=True)
+        
+        # Upload new picture
+        uploaded_file = st.file_uploader("Change Profile Image", type=["png", "jpg", "jpeg"], key="profile_image_uploader")
 
+    with col_info:
+        st.subheader("Account Details")
+        st.markdown(f"**Username:** `{user_id}`")
+        st.markdown(f"**Role:** `{st.session_state.role.capitalize()}`")
+        
+        # Birthday input
+        st.markdown("---")
+        st.subheader("Personal Information")
+        
+        # Handle date conversion for date_input default value
+        default_bday = None
+        if current_data.get('birthday'):
+            try:
+                # New logic: Convert SQL date string to Python date object
+                default_bday = date.fromisoformat(current_data['birthday'])
+            except (ValueError, TypeError):
+                pass 
+        
+        new_birthday = st.date_input("Birthday", value=default_bday, key="profile_birthday", max_value=date.today())
+        
+        if st.button("Save Profile Updates", type="primary", use_container_width=True):
+            conn = get_db_connection()
+            
+            # If a new file was uploaded, use its Base64. Otherwise, use the existing one.
+            b64_image = image_to_base64(uploaded_file) if uploaded_file else current_data.get('profile_picture_b64')
+            
+            # Update user data (Birthday is stored as ISO format string)
+            conn.execute("UPDATE USERS SET profile_picture_b64 = ?, birthday = ? WHERE username = ?",
+                         (b64_image, str(new_birthday), user_id))
+            conn.commit()
+            st.success("Profile updated successfully!")
+            st.cache_data.clear() # Clear user data cache to refresh view
+            st.rerun()
+
+    st.markdown("---")
     st.subheader("Your Order History")
-    # Optimization: Use cached order history
-    order_history_df = get_order_history(user_id)
-
-    if order_history_df.empty:
-        st.info("You have no past orders yet.")
+    # Fetch and display order history
+    orders_query = """
+    SELECT 
+        O.order_id, O.total_amount, O.order_date, O.tracking_id, O.discount_rate
+    FROM ORDERS AS O
+    WHERE O.user_id = ?
+    ORDER BY O.order_date DESC
+    """
+    orders_df = pd.read_sql_query(orders_query, conn, params=(user_id,))
+    
+    if orders_df.empty:
+        st.info("You have not placed any orders yet.")
     else:
+        # Convert discount rate to percentage for display
+        orders_df['discount_rate_pct'] = (orders_df['discount_rate'] * 100).astype(int)
+        
         st.dataframe(
-            order_history_df,
+            orders_df.drop(columns=['discount_rate']),
             column_config={
-                "order_id": "Order ID",
-                # CHANGED: Replaced $ with ₹ in column configuration
+                "order_id": "Order #",
                 "total_amount": st.column_config.NumberColumn("Total Paid (₹)", format="₹%.2f"),
+                "order_date": "Date",
                 "tracking_id": "Tracking ID",
-                "order_date": "Date Placed",
+                "discount_rate_pct": st.column_config.NumberColumn("Discount", format="%d%%", help="Discount Applied"),
             },
-            hide_index=True
+            hide_index=True,
+            use_container_width=True
         )
 
 def customer_faq_enquiries():
-    """Section for FAQs and enquiries."""
-    st.markdown("### ❓ Customer Enquiries & FAQ")
+    """Simple FAQ and simulated contact form (FEATURE 15)."""
+    st.title("FAQ & Customer Service")
     st.markdown("""
+        ### Frequently Asked Questions
+        
         **Q: How long does shipping take?**
-        A: Standard shipping takes 5-7 business days.
-        **Q: What is your return policy?**
-        A: We accept returns within 30 days of purchase.
-        """)
+        A: Standard shipping takes 5-7 business days. You can track your order using the Tracking ID in your Order History under the User Profile.
+        
+        **Q: Can I return an item?**
+        A: Yes, returns are accepted within 30 days of delivery. Please contact customer service below for a return authorization.
+        
+        **Q: How does the Spin the Wheel discount work?**
+        A: The Spin the Wheel is a fun way to win an extra discount on your current checkout. You can spin once per order!
+    """)
+    st.markdown("---")
     st.subheader("Contact Us")
-    st.info("Email support@tshirts.com for enquiries.")
+    with st.form("contact_form"):
+        name = st.text_input("Your Name")
+        email = st.text_input("Your Email")
+        enquiry = st.text_area("Your Enquiry")
+        if st.form_submit_button("Submit Enquiry", type="primary", use_container_width=True):
+            if name and email and enquiry:
+                # Placeholder for submission logic
+                st.success(f"Thank you, {name}. Your enquiry has been submitted and we will respond to {email} shortly.")
+            else:
+                st.error("Please fill out all fields.")
 
-# --- MAIN APP LAYOUT ---
+
+# --- MAIN APP LAYOUT & NAVIGATION ---
 
 def main_app():
     """The main entry point for the Streamlit application."""
-    init_db()
+    try:
+        init_db()
+    except Exception as e:
+        st.error(f"FATAL ERROR: Could not initialize database. App cannot start. Error: {e}")
+        # Stop execution if DB fails to initialize
+        sys.exit(1) 
 
     with st.sidebar:
+        # Display T-Shirt icon prominently
         st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/1/18/T-shirt_blue_outline.svg/100px-T-shirt_blue_outline.svg.png")
         st.title("T-Shirt Shop")
 
         if st.session_state.logged_in:
             st.success(f"User: {st.session_state.username} ({st.session_state.role.capitalize()})")
-            if st.button("Logout", key="logout_btn"): logout()
+            if st.button("Logout", key="logout_btn", use_container_width=True): logout()
 
-            if st.session_state.role == 'customer':
-                st.divider()
-                
-                # Navigation links
-                if st.button("🏠 Catalog", key="catalog_link"):
+            st.divider()
+
+            if st.session_state.role == 'admin':
+                st.subheader("Admin Menu")
+                # Navigation for admin views
+                if st.button("📦 Manage Products/Inventory", key="admin_products", use_container_width=True): st.session_state.current_view = 'admin_products'
+                if st.button("📈 Performance Tracking", key="admin_performance", use_container_width=True): st.session_state.current_view = 'admin_performance'
+            
+            elif st.session_state.role == 'customer':
+                st.subheader("Customer Menu")
+                # Navigation for customer views
+                if st.button("🏠 Catalog", key="catalog_link", use_container_width=True): 
                     st.session_state.current_view = 'catalog'
-                    st.session_state.checkout_stage = 'catalog'
-                    st.rerun()
-
-                if st.button("👤 User Profile", key="profile_btn"):
+                    st.session_state.checkout_stage = 'catalog' # Reset checkout state
+                if st.button("👤 User Profile / History", key="profile_btn", use_container_width=True): 
                     st.session_state.current_view = 'profile'
-                    st.session_state.checkout_stage = 'catalog'
-                    st.rerun()
+                    st.session_state.checkout_stage = 'catalog' # Reset checkout state
 
                 st.divider()
                 st.subheader("🛒 Your Cart")
-                # Optimization: Pass user_id and cart_version to get cached data
+                # Fetch cart and display summary
                 cart_df = get_user_cart(st.session_state.username, st.session_state.cart_version)
                 
                 if cart_df.empty:
                     st.markdown("Your cart is empty.")
                 else:
-                    total = (cart_df['price'] * cart_df['quantity']).sum()
-                    # CHANGED: Replaced $ with ₹ in metric display
-                    st.metric("Total", f"₹{total:.2f}")
+                    total = (cart_df['selling_price'] * cart_df['cart_quantity']).sum()
+                    st.metric("Total Cart Value", f"₹{total:.2f}")
 
-                    if st.button("Proceed to Checkout", key="buy_btn", type="primary"):
+                    if st.button("Proceed to Checkout", key="buy_btn", type="primary", use_container_width=True):
                         st.session_state.checkout_stage = 'payment'
-                        st.session_state.current_view = 'catalog' # Keep view context clean
+                        st.session_state.current_view = 'catalog' # Stay on catalog view but trigger checkout logic
                         st.session_state.checkout_substage = 'payment_form'
-                        st.session_state.coupon_code = None # Reset coupon on starting checkout
-                        st.session_state.discount_rate = 0.0 # Reset discount
+                        st.session_state.coupon_code = None
+                        st.session_state.discount_rate = 0.0
                         st.rerun()
         else:
             auth_forms()
-            st.markdown("---")
-            st.caption("Admin: `admin` / `adminpass`")
-            st.caption("Customer: `customer1` / `custpass`")
 
-
-    # Main Content Area
+    # Main Content Area Routing
     if not st.session_state.logged_in:
         st.title("T-Shirt Inventory Portal")
-        st.info("Please log in to proceed.")
+        st.info("Please log in to proceed. Default users: `admin`/`adminpass`, `customer1`/`custpass`")
 
     elif st.session_state.role == 'admin':
-        st.title("👨‍💻 Admin Dashboard")
-        tab1, tab2 = st.tabs(["Add Product", "View Inventory"])
-        with tab1: admin_add_product()
-        # Optimization: Call wrapper function for cached display
-        with tab2: display_admin_inventory()
+        if st.session_state.current_view == 'admin_performance':
+            admin_performance_tracking()
+        else: # Default or 'admin_products'
+            st.title("👨‍💻 Admin Dashboard")
+            tab1, tab2 = st.tabs(["Add Product Template", "Manage Inventory/View Products"])
+            with tab1: admin_add_product_template()
+            with tab2: 
+                products_df = admin_get_products(st.session_state.product_version)
+                st.markdown("### Product Templates Overview")
+                
+                if products_df.empty:
+                    st.info("No product templates exist. Use the 'Add Product Template' tab.")
+                else:
+                    # FEATURE 4: Display image in admin view
+                    products_df['Image'] = products_df['base_image_b64'].apply(lambda x: b64_to_image_html(x, width=50))
+                    
+                    st.dataframe(
+                        products_df[['Image', 'name', 'category', 'total_stock', 'min_price', 'max_price', 'id']],
+                        column_config={
+                            "Image": st.column_config.Column("Image", width="small", help="Product Image"),
+                            "total_stock": "Total Stock",
+                            "min_price": st.column_config.NumberColumn("Min Price (₹)", format="₹%.2f"),
+                            "max_price": st.column_config.NumberColumn("Max Price (₹)", format="₹%.2f"),
+                            "name": "Product Name",
+                            "category": "Category",
+                            "id": None, 
+                        },
+                        hide_index=True,
+                        use_container_width=True
+                    )
+                    
+                    # Selection for inventory management
+                    product_selection_id = st.selectbox(
+                        "Select Product Template to Manage Inventory (Sizes/Costs/Prices)", 
+                        options=products_df['id'].tolist(),
+                        format_func=lambda x: products_df[products_df['id'] == x]['name'].iloc[0]
+                    )
+                    admin_add_inventory_item(product_selection_id)
+                    
 
     elif st.session_state.role == 'customer':
         view = st.session_state.get('current_view', 'catalog')
         checkout_stage = st.session_state.get('checkout_stage', 'catalog')
 
-        # Checkout overrides all other views
+        # Checkout overrides all other views when triggered
         if checkout_stage == 'payment':
             st.title("Secure Checkout")
-            # Optimization: Pass the immediately retrieved cart to avoid a duplicate fetch inside checkout
+            # Must pass the current cart data
             cart_df_for_checkout = get_user_cart(st.session_state.username, st.session_state.cart_version)
             customer_checkout(cart_df_for_checkout)
         
-        # Other views (Catalog/Detail/Profile)
         elif view == 'profile':
             user_profile_view()
             
@@ -701,7 +1127,6 @@ def main_app():
             product_detail_view()
 
         else: # Default: 'catalog' view
-            st.title("Welcome to the Customer Shop")
             tab1, tab2 = st.tabs(["T-Shirt Catalog", "FAQ / Enquiries"])
             with tab1: customer_browse_products()
             with tab2: customer_faq_enquiries()
