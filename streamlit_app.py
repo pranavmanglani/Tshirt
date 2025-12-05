@@ -43,6 +43,8 @@ def init_db():
     Initializes database tables and populates initial data.
     Uses a global lock to ensure this happens safely and only once, 
     preventing race conditions and 'database is locked' errors.
+    
+    CRITICAL CHANGE: USERS table is now created non-destructively to prevent losing signed-up users.
     """
     # Use the lock to ensure only one thread initializes the database at a time
     with DB_INIT_LOCK:
@@ -50,31 +52,46 @@ def init_db():
         c = conn.cursor()
 
         try:
-            # Check if DESIGNS table exists AND has the necessary columns.
-            # This is a robust check to ensure the schema is correct.
+            # --- USERS Table (Prevent Data Loss on Rerun) ---
+            # 1. Create USERS table if it doesn't exist
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS USERS (
+                    username TEXT PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE, 
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL
+                );
+            ''')
+            
+            # 2. Insert default user only if the USERS table is empty
+            c.execute("SELECT COUNT(*) FROM USERS")
+            user_count = c.fetchone()[0]
+            if user_count == 0:
+                c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
+                          ('admin', 'admin@company.com', hash_password('adminpass'), 'admin'))
+                c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
+                          ('customer1', 'cust1@email.com', hash_password('customerpass'), 'customer'))
+
+
+            # --- DESIGNS and PRODUCTION_LOG Tables (Initial Data Setup) ---
+            # These tables are still checked and recreated if necessary to ensure fresh sample data and correct schema.
+            
+            # Check if DESIGNS table exists AND has the necessary columns (price_usd).
             c.execute("PRAGMA table_info(DESIGNS)")
             columns = [info[1] for info in c.fetchall()]
             
             needs_init = True
-            if 'DESIGNS' in columns and 'price_usd' in columns:
+            # We check the table info to see if the table exists AND has the required columns from our last fix
+            if 'name' in columns and 'price_usd' in columns:
                 # If table exists with correct schema, check for data presence
                 if c.execute("SELECT 1 FROM DESIGNS LIMIT 1").fetchone():
                     needs_init = False
             
             if needs_init:
-                # 1. Define all necessary tables (DDL)
+                # Drop and recreate production tables
                 c.executescript('''
-                    -- Drop and recreate tables to ensure clean state with correct schema
-                    DROP TABLE IF EXISTS USERS;
                     DROP TABLE IF EXISTS DESIGNS;
                     DROP TABLE IF EXISTS PRODUCTION_LOG;
-
-                    CREATE TABLE USERS (
-                        username TEXT PRIMARY KEY,
-                        email TEXT NOT NULL UNIQUE, 
-                        password_hash TEXT NOT NULL,
-                        role TEXT NOT NULL
-                    );
 
                     CREATE TABLE DESIGNS (
                         design_id INTEGER PRIMARY KEY,
@@ -93,15 +110,7 @@ def init_db():
                     );
                 ''')
                 
-                # 2. Populate Initial Data (DML)
-                
-                # Users
-                c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
-                          ('admin', 'admin@company.com', hash_password('adminpass'), 'admin'))
-                c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
-                          ('customer1', 'cust1@email.com', hash_password('customerpass'), 'customer'))
-
-                # Designs
+                # Populate Designs
                 c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Logo Tee', 'Standard company logo print', 24.99))
                 c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Abstract Art', 'Limited edition vibrant print', 35.50))
                 c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Vintage Stripes', 'Classic striped design', 19.99))
@@ -155,20 +164,25 @@ def signup_user(username, email, password):
     conn = get_db_connection()
     
     try:
+        # Use the connection as a context manager for automatic commit/rollback
         with conn:
             c = conn.cursor()
-            if c.execute("SELECT username FROM USERS WHERE username = ? OR email = ?", (username, email)).fetchone():
+            # Check if user/email already exists
+            c.execute("SELECT username FROM USERS WHERE username = ? OR email = ?", (username, email))
+            if c.fetchone():
                 return False, "Username or Email already exists."
             
             password_hash = hash_password(password)
             default_role = 'customer' 
+            # Insert the new user
             c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
                       (username, email, password_hash, default_role))
             return True, "Registration successful. You can now log in."
     except sqlite3.IntegrityError:
-        return False, "Database error during registration."
+        return False, "Database error during registration. Ensure username/email is unique."
     except Exception as e:
-        return False, f"An unexpected error occurred: {e}"
+        # st.error(f"Signup error: {e}") # Debugging aid
+        return False, "An unexpected error occurred during registration."
     finally:
         conn.close()
 
@@ -184,7 +198,6 @@ def get_production_data(cache_refresher):
     df = pd.DataFrame() # Initialize empty DataFrame
     try:
         # Fetch all data from the PRODUCTION_LOG table, joining with DESIGNS to get current price
-        # The query is correct, relies on init_db() having succeeded.
         query = """
         SELECT 
             p.*, 
@@ -196,7 +209,7 @@ def get_production_data(cache_refresher):
         df = pd.read_sql_query(query, conn)
         
         if df.empty:
-             st.error("No production data available. Sample data failed to load or has been deleted.")
+             st.warning("No production data available. Sample data failed to load or has been deleted.")
              return pd.DataFrame()
              
         # Calculate potential revenue for each log entry
@@ -205,10 +218,11 @@ def get_production_data(cache_refresher):
         return df
         
     except pd.io.sql.DatabaseError as e:
-        st.error(f"Database Read Error: Could not fetch production data. Execution failed on sql ' SELECT p.*, d.price_usd FROM PRODUCTION_LOG p JOIN DESIGNS d ON p.product_name = d.name ORDER BY p.log_date ': {e}")
+        # This error is expected if the production tables haven't been created yet
+        # st.error(f"Database Read Error: Could not fetch production data. Execution failed on sql ' SELECT p.*, d.price_usd FROM PRODUCTION_LOG p JOIN DESIGNS d ON p.product_name = d.name ORDER BY p.log_date ': {e}")
         return pd.DataFrame()
     except Exception as e:
-        st.error(f"An unexpected error occurred during data fetching: {e}")
+        # st.error(f"An unexpected error occurred during data fetching: {e}")
         return pd.DataFrame()
     finally:
         conn.close() # Close the connection after reading
@@ -284,6 +298,9 @@ def signup_page():
                 if success:
                     st.success(message)
                     st.balloons()
+                    # Force a login page rerun to clear signup fields after success
+                    st.session_state['page'] = 'login'
+                    st.rerun()
                 else:
                     st.error(message)
 
@@ -540,9 +557,6 @@ def manage_designs_page():
                         conn.close()
                 else:
                     st.error("Design Name cannot be empty.")
-
-    with col2:
-        view_designs_page()
 
 def view_designs_page():
     """Displays all available designs."""
