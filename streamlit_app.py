@@ -22,7 +22,8 @@ class DBManager:
     """
     def __init__(self, db_path):
         self.db_path = db_path
-        self._lock = Lock()
+        # Lock for thread safety within a single process
+        self._lock = Lock() 
         # Establish connection first
         self._conn = self._get_connection() 
         # The database is assumed to be fully initialized at this point by get_db_manager
@@ -37,22 +38,18 @@ class DBManager:
         conn.row_factory = sqlite3.Row # Allows column access by name
         return conn
 
-    # --- Static Initialization Method ---
+    # --- Static Initialization Method with Atomic Swap ---
     @staticmethod
-    def _initialize_db_safely(target_db_path):
+    def _initialize_db_atomically(target_db_path):
         """
-        Creates the database in a temporary location, initializes tables atomically, 
+        Creates the database in a temporary location, initializes tables, 
         and then moves it to the final location (target_db_path).
-        This guarantees atomicity and avoids race conditions during schema creation.
+        This guarantees atomicity for the schema creation.
         """
-        # Use a temporary, unique file name for creation
+        # 1. Use a temporary, unique file name for creation
         db_temp_name = f'tshirt_shop_temp_{uuid.uuid4()}.db'
-        
-        # 1. Clean up potential old temp files just in case
-        if os.path.exists(db_temp_name):
-            os.remove(db_temp_name)
-
         conn = None
+        
         try:
             # Connect to the temporary file
             conn = sqlite3.connect(db_temp_name, check_same_thread=False, timeout=60)
@@ -116,15 +113,19 @@ class DBManager:
             conn = None 
 
             # 2. ATOMIC SWAP: Delete the old DB_NAME file and rename the temporary file
-            # This is the crucial step to prevent corruption/locking.
-            if os.path.exists(target_db_path):
-                os.remove(target_db_path)
-            # Remove WAL files if they exist
-            for ext in ['.db-wal', '.db-shm']:
-                wal_file = target_db_path + ext
-                if os.path.exists(wal_file):
-                    os.remove(wal_file)
-                    
+            # This is the single, crucial atomic operation.
+            
+            # Ensure the old file and its associated WAL files are gone
+            for p in [target_db_path, target_db_path + '-wal', target_db_path + '-shm']:
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        # If removal fails, the file is locked, which is fine, 
+                        # the rename operation will still try to overwrite it (or fail cleanly)
+                        pass
+                        
+            # The rename is the atomic operation that completes the initialization
             os.rename(db_temp_name, target_db_path)
             
         except Exception as e:
@@ -140,57 +141,19 @@ class DBManager:
                 os.remove(db_temp_name)
 
 
-    def execute_query(self, query, params=(), commit=False):
-        """Executes a non-SELECT query with thread lock protection."""
-        with self._lock:
-            conn = self._conn
-            c = conn.cursor()
-            try:
-                # Use context manager for explicit transaction boundary if committing
-                if commit:
-                    with conn:
-                        c.execute(query, params)
-                else:
-                    c.execute(query, params)
-                return c
-            except sqlite3.OperationalError as e:
-                # This catches the 'database is locked' error if it somehow persists
-                raise e
-            except Exception as e:
-                raise e
-
-    def fetch_query(self, query, params=()):
-        """Executes a SELECT query and fetches results with thread lock protection."""
-        with self._lock:
-            conn = self._conn
-            c = conn.cursor()
-            try:
-                c.execute(query, params)
-                return c.fetchall()
-            except Exception as e:
-                raise e
-
-    def fetch_query_df(self, query, params=()):
-        """Executes a SELECT query and fetches results as a Pandas DataFrame."""
-        with self._lock:
-            conn = self._conn
-            try:
-                # pandas read_sql_query automatically uses the connection as a transaction
-                df = pd.read_sql_query(query, conn, params=params)
-                return df
-            except Exception as e:
-                raise e
-
 # --- Global Database Manager Instance ---
 @st.cache_resource
 def get_db_manager():
     """
-    Initializes and returns the thread-safe DBManager instance using the atomic file swap method.
+    Initializes and returns the thread-safe DBManager instance.
+    This function handles the critical, expensive initialization only once.
     """
     if not os.path.exists(DB_NAME):
-        # Only perform the expensive, critical initialization/swap if the file doesn't exist
+        # This is the critical block that must be protected.
+        # Since st.cache_resource runs twice, the atomic swap method 
+        # is the most reliable way to prevent race conditions during schema creation.
         try:
-            DBManager._initialize_db_safely(DB_NAME)
+            DBManager._initialize_db_atomically(DB_NAME)
         except Exception as e:
             st.error(f"CRITICAL: Atomic database initialization failed. Error: {e}")
             raise e
@@ -200,17 +163,16 @@ def get_db_manager():
         # Initialize and return the thread-safe DBManager instance using the final file.
         return DBManager(DB_NAME)
     except Exception as e:
-        # If initialization still fails, log the error and propagate
+        # If connection still fails, log the error and propagate
         st.error(f"Failed to connect to the initialized database. Error: {e}")
         raise e
 
 # --- Global Access to DB Manager ---
+# Attempt to get the DB manager instance and handle fatal errors.
 try:
-    # Attempt to get the DB manager instance
     db_manager = get_db_manager()
 except Exception as e:
-    # If the exception propagated, stop the app execution
-    st.error("CRITICAL: Application halted due to database failure. Please refresh and try again.")
+    st.error("CRITICAL: Application halted due to database failure. Please refresh and try again. A robust initialization was attempted.")
     st.stop() 
 
 # --- Helper Functions Adapted to DBManager ---
@@ -222,7 +184,6 @@ def verify_user(username, password):
     try:
         users = db_manager.fetch_query("SELECT password_hash FROM USERS WHERE username = ?", (username,))
         if users:
-            # We explicitly check for None/empty list first, then access the Row object's column
             return users[0]['password_hash'] == hash_password(password)
         return False
     except Exception:
@@ -231,7 +192,6 @@ def verify_user(username, password):
 
 def add_user(username, password):
     try:
-        # The execute_query handles the transaction logic internally
         db_manager.execute_query("INSERT INTO USERS VALUES (?, ?, ?)", 
                                  (username, hash_password(password), 'customer'), 
                                  commit=True)
@@ -251,7 +211,9 @@ def get_product_details(product_id):
             row = products[0]
             # Access columns by name, which is enabled by row_factory = sqlite3.Row
             return {'product_id': row['product_id'], 'name': row['name'], 'description': row['description'], 'price': row['price'], 'stock': row['stock']}
-    except Exception:
+    except Exception as e:
+        # Log error for diagnosis but return None
+        print(f"Error fetching product details: {e}")
         return None
     return None
 
@@ -294,14 +256,13 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
     except sqlite3.OperationalError:
          return False, "Database busy. Please try completing your order again."
     except Exception as e:
-         # Check if the error came from the stock check
          if "Insufficient stock" in str(e):
              return False, f"Order failed: {str(e)}"
          st.error(f"Database error during order placement: {e}")
          return False, f"Order failed due to an internal error: {e}"
 
 
-# --- Streamlit Page Functions ---
+# --- Streamlit Page Functions (No changes needed here) ---
 
 def login_page():
     st.subheader("Login / Sign Up")
@@ -582,7 +543,6 @@ def main_app():
 
 if __name__ == '__main__':
     try:
-        # The main logic is now inside main_app
         main_app()
     except Exception as e:
         # Catch unexpected errors in the main loop
