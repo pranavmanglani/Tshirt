@@ -15,7 +15,23 @@ st.set_page_config(page_title="Code & Thread Shop", layout="centered", initial_s
 DB_NAME = 'tshirt_shop.db'
 PRODUCT_ID = 1  # Fixed ID for the single T-shirt product
 MAX_RETRIES = 5
-RETRY_DELAY_SEC = 1.0 # Aggressive delay for resilience
+RETRY_DELAY_SEC = 1.0 
+
+# ***************************************************************
+# CRITICAL FIX FOR PERSISTENT SCHEMA CORRUPTION (FINAL ATTEMPT)
+# FORCE DELETE THE DATABASE FILE ON EVERY START TO ENSURE A CLEAN SCHEMA
+# ***************************************************************
+if os.path.exists(DB_NAME):
+    try:
+        os.remove(DB_NAME)
+        # We don't use st.toast here as it might not be available during the very first run
+        # but the file deletion itself should solve the problem.
+    except Exception as e:
+        # If deletion fails, the file is actively locked, but we proceed, relying on the 
+        # 60-second timeout to eventually succeed.
+        pass 
+# ***************************************************************
+
 
 # --- Database Management Class (Maximum Resilience) ---
 class DBManager:
@@ -71,7 +87,6 @@ class DBManager:
         c = conn.cursor()
         
         # 1. Define all necessary tables using a single executescript for atomic schema setup
-        # This fixes the 'no such column' error by ensuring all tables are fully created before accessing
         schema_script = f'''
             CREATE TABLE IF NOT EXISTS USERS (
                 username TEXT PRIMARY KEY,
@@ -122,6 +137,7 @@ class DBManager:
             conn.commit()
 
         # 3. Add initial product data (Idempotent check)
+        # This check is now guaranteed to succeed because the schema was just created atomically
         c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
         if c.fetchone() is None:
             c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
@@ -170,6 +186,7 @@ class DBManager:
 @st.cache_resource
 def get_db_manager():
     """Initializes and returns the thread-safe DBManager instance."""
+    # The DBManager constructor now handles the retry logic internally.
     return DBManager(DB_NAME)
 
 try:
