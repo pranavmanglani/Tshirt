@@ -25,8 +25,9 @@ def initialize_database(target_db_path):
     """
     conn = None
     try:
+        # If file exists, remove it to ensure clean sample data insertion
         if os.path.exists(target_db_path):
-             return
+             os.remove(target_db_path)
              
         conn = sqlite3.connect(target_db_path, check_same_thread=False, timeout=60)
         conn.row_factory = sqlite3.Row
@@ -125,6 +126,10 @@ def initialize_database(target_db_path):
                 ('ORD-20240215-003', 'customer1@email.com', '2024-02-15T14:30:00', 30.00, 10.00, 20.00, 'Delivered', 'John Doe', '123 Main St', 'CityA', '10001'),
                 # Order 4 (Mar 10, 2024): 1x Tee, 1x Hoodie ($25 + $55 = $80.00) - Profit: 15+30=45
                 ('ORD-20240310-004', 'customer1@email.com', '2024-03-10T11:00:00', 80.00, 35.00, 45.00, 'Shipped', 'John Doe', '123 Main St', 'CityA', '10001'),
+                # Order 5 (Mar 25, 2024): 1x Cap ($20.00) - Profit: 12.50
+                ('ORD-20240325-005', 'customer1@email.com', '2024-03-25T15:00:00', 20.00, 7.50, 12.50, 'Processing', 'John Doe', '123 Main St', 'CityA', '10001'),
+                # Order 6 (Feb 01, 2024): 1x Tee ($25.00)
+                ('ORD-20240201-006', 'admin@shop.com', '2024-02-01T09:00:00', 25.00, 10.00, 15.00, 'Shipped', 'Admin User', '456 Side Ave', 'CityB', '20002'),
             ]
             c.executemany("INSERT INTO ORDERS VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", sample_orders)
 
@@ -139,12 +144,17 @@ def initialize_database(target_db_path):
                 ('ORD-20240310-004', 1, 'S', 1, 25.00, 10.00),
                 # Items for ORD-20240310-004 (Product ID 2: Hoodie)
                 ('ORD-20240310-004', 2, 'XL', 1, 55.00, 25.00), 
+                # Items for ORD-20240325-005 (Product ID 4: Cap)
+                ('ORD-20240325-005', 4, 'N/A', 1, 20.00, 7.50),
+                # Items for ORD-20240201-006 (Product ID 1: Tee)
+                ('ORD-20240201-006', 1, 'L', 1, 25.00, 10.00),
             ]
             # Note: item_id is AUTOINCREMENT, so we only list 6 parameters here
             c.executemany("INSERT INTO ORDER_ITEMS (order_id, product_id, size, quantity, unit_price, unit_cost) VALUES (?, ?, ?, ?, ?, ?)", sample_items)
             
 
     except Exception as e:
+        # Clean up failed file if it exists
         if os.path.exists(target_db_path):
              os.remove(target_db_path)
         raise Exception(f"CRITICAL DB INIT ERROR: {e}")
@@ -205,18 +215,22 @@ class DBManager:
                 raise e
 
 # --- Global Database Manager Instance (Protected Cache) ---
-@st.cache_resource
+@st.cache_resource(suppress_st_warning=True)
 def get_db_manager():
-    if not os.path.exists(DB_NAME):
-        time.sleep(1) 
-        if os.path.exists(DB_NAME):
-            pass
-        else:
-            try:
-                initialize_database(DB_NAME)
-            except Exception as e:
-                st.error(f"FATAL: Database initialization failed. Error: {e}")
-                raise e
+    # FORCE DATABASE RECREATION to ensure sample data is always present
+    if os.path.exists(DB_NAME):
+        # Clear the cache before removing the file to prevent errors
+        st.cache_resource.clear()
+        os.remove(DB_NAME)
+        time.sleep(0.5) 
+
+    # Since the file is removed, we must re-initialize it below.
+    try:
+        initialize_database(DB_NAME)
+    except Exception as e:
+        st.error(f"FATAL: Database initialization failed. Error: {e}")
+        raise e
+        
     try:
         return DBManager(DB_NAME)
     except Exception as e:
@@ -835,7 +849,7 @@ def admin_analytics():
     df_orders = db_manager.fetch_query_df("SELECT * FROM ORDERS")
     
     if df_orders.empty:
-        st.info("No orders placed yet. Financial metrics not available. Try adding some sample orders!")
+        st.info("No orders placed yet. Financial metrics not available.")
         return
 
     # --- KPI Cards ---
@@ -987,7 +1001,7 @@ def dashboard_page():
 def order_complete_page():
     st.title("Order Confirmed!")
     order_id = st.session_state.get('last_order_id', 'N/A')
-    st.success(f"Thank you for your purchase, {st.session_state['username'].capitalize()}!")
+    st.success(f"Thank you for your purchase, {st.session_state['username'].capitalize()}")
     st.markdown(f"Your order ID is: **{order_id}**")
     st.info("You can track your order in the dashboard.")
 
