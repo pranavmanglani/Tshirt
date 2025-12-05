@@ -142,8 +142,12 @@ def signup_user(username, email, password): # Removed 'role' argument
 # Use st.cache_data to store the returned DataFrame. The cache will be cleared when 
 # the 'Production Log Added' message is shown, triggering a chart update.
 @st.cache_data
-def get_production_data(conn, cache_refresher): # Added placeholder argument for manual cache clearing
-    """Fetches production log data along with current product price for revenue calculation."""
+def get_production_data(cache_refresher): # Removed 'conn' argument
+    """
+    Fetches production log data. 
+    The 'cache_refresher' argument is only used to force a cache clear on data updates.
+    """
+    conn = get_db_connection() # Get the cached connection object internally
     try:
         # Fetch all data from the PRODUCTION_LOG table, joining with DESIGNS to get current price
         query = """
@@ -228,12 +232,13 @@ def signup_page():
 
 def performance_and_sales_page():
     """Displays improved production performance graphs and revenue metrics."""
-    conn = get_db_connection()
+    # conn = get_db_connection() # Removed direct connection passing
     st.title("📈 Performance and Sales Tracking")
 
     # Use st.session_state.get('db_refresher', 0) to force cache invalidation
-    # when new data is successfully logged.
-    df = get_production_data(conn, st.session_state.get('db_refresher', 0))
+    # Only passing the hashable integer refresher
+    df = get_production_data(st.session_state.get('db_refresher', 0))
+    
     if df.empty:
         st.info("No production data available yet. Please log some production runs to see the graphs.")
         return
