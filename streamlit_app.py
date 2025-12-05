@@ -3,7 +3,7 @@ import sqlite3
 import pandas as pd
 import hashlib
 import random
-import time # Added for safe retry logic
+import time 
 
 # --- CONFIGURATION & UTILITIES ---
 
@@ -304,6 +304,7 @@ def clear_user_cart(user_id):
 
 def spin_the_wheel_logic():
     """Simulates a discount wheel spin and updates session state."""
+    # Define available discount codes and their corresponding rates
     discounts = {
         "NO-LUCK": 0.0,
         "SAVE5": 0.05,
@@ -354,18 +355,18 @@ def customer_checkout(cart_df):
         )
         
         # Display individual remove buttons below the table
+        # We need to create a layout that supports dynamic button creation
+        st.markdown("**Remove Individual Items:**")
         cols_remove = st.columns(3)
-        # Ensure we don't access columns beyond the index size
-        num_items = len(cart_df)
+        
         for index, row in cart_df.iterrows():
             col_index = index % 3
-            if col_index < 3: # Safety check
-                cols_remove[col_index].button(
-                    f"Remove 1x {row['name']} ({row['size']})", 
-                    key=f"remove_{row['cart_item_id']}", 
-                    on_click=remove_from_cart, 
-                    args=(row['cart_item_id'],)
-                )
+            cols_remove[col_index].button(
+                f"Remove 1x {row['name']} ({row['size']})", 
+                key=f"remove_{row['cart_item_id']}", 
+                on_click=remove_from_cart, 
+                args=(row['cart_item_id'],)
+            )
 
         st.markdown("---")
         
