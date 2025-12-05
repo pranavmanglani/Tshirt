@@ -8,15 +8,23 @@ from datetime import datetime, timedelta
 # --- Configuration ---
 st.set_page_config(layout="wide", page_title="T-Shirt Production Tracker", page_icon="👕")
 
-# --- Database Connection and Setup ---
+# --- Database Connection and Setup (Thread-Safe SQLite) ---
 
-# Use st.cache_resource for persistent, safe connection across reruns.
-# This ensures the connection object is shared across all sessions.
+# CRITICAL FIX: Cache the connection parameters (file path), not the connection object itself.
 @st.cache_resource
+def get_db_path():
+    """Returns the database file path, cached as a resource."""
+    return 'tshirt_app.db'
+
 def get_db_connection():
-    """Returns a cached, thread-safe SQLite database connection."""
-    # Use check_same_thread=False for Streamlit environment to avoid threading issues
-    conn = sqlite3.connect('tshirt_app.db', check_same_thread=False)
+    """
+    Returns a new, isolated SQLite connection for the current thread/operation.
+    This resolves the 'DatabaseError' caused by thread contention/locking.
+    """
+    db_path = get_db_path()
+    # Ensure check_same_thread=False for Streamlit environment to avoid thread safety errors 
+    # when reading or writing from different script reruns.
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row # Allows accessing columns by name
     return conn
 
@@ -26,6 +34,7 @@ def hash_password(password):
 
 def init_db():
     """Initializes database tables and populates initial data."""
+    # Use a new connection for initialization
     conn = get_db_connection()
     c = conn.cursor()
 
@@ -54,54 +63,59 @@ def init_db():
             defects INTEGER NOT NULL
         );
     ''')
+    conn.close() # Close the connection used for DDL
 
     # Add initial data if tables are empty (DML)
     try:
-        # Use 'with conn:' context manager for proper transaction boundaries (COMMIT/ROLLBACK)
-        with conn:
-            # Add initial users
-            if not c.execute("SELECT 1 FROM USERS").fetchone():
-                c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
-                          ('admin', 'admin@company.com', hash_password('adminpass'), 'admin'))
-                c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
-                          ('customer1', 'cust1@email.com', hash_password('customerpass'), 'customer'))
+        conn = get_db_connection() # Open a new connection for DML
+        c = conn.cursor()
+        
+        # Check and insert initial users
+        if not c.execute("SELECT 1 FROM USERS").fetchone():
+            c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
+                      ('admin', 'admin@company.com', hash_password('adminpass'), 'admin'))
+            c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
+                      ('customer1', 'cust1@email.com', hash_password('customerpass'), 'customer'))
 
-            # Add initial designs
-            if not c.execute("SELECT 1 FROM DESIGNS").fetchone():
-                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Logo Tee', 'Standard company logo print', 24.99))
-                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Abstract Art', 'Limited edition vibrant print', 35.50))
-                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Vintage Stripes', 'Classic striped design', 19.99))
+        # Check and insert initial designs
+        if not c.execute("SELECT 1 FROM DESIGNS").fetchone():
+            c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Logo Tee', 'Standard company logo print', 24.99))
+            c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Abstract Art', 'Limited edition vibrant print', 35.50))
+            c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Vintage Stripes', 'Classic striped design', 19.99))
 
-            # Add significantly more mock production logs (10 days of data)
-            if not c.execute("SELECT 1 FROM PRODUCTION_LOG").fetchone():
-                today = datetime.now().date()
-                data = []
-                
-                # Generate data for the last 10 days
-                for i in range(1, 11):
-                    log_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
-                    
-                    # Design 1: Logo Tee (High volume, low defect rate)
-                    data.append((log_date, 'Logo Tee', 'M', 100 + i*10, 5 + (i//3)))
-                    data.append((log_date, 'Logo Tee', 'L', 120 + i*5, 4 + (i//4)))
-
-                    # Design 2: Abstract Art (Medium volume, medium defect rate)
-                    data.append((log_date, 'Abstract Art', 'S', 50 + i*3, 2 + (i//2)))
-                    data.append((log_date, 'Abstract Art', 'XL', 70 + i*2, 3 + (i//2)))
-                    
-                    # Design 3: Vintage Stripes (Low volume, high defect rate simulation)
-                    data.append((log_date, 'Vintage Stripes', 'M', 30 + i*2, 1 + i))
-                    
-                # Add a few logs for today
-                data.append((today.strftime('%Y-%m-%d'), 'Logo Tee', 'M', 150, 6))
-                data.append((today.strftime('%Y-%m-%d'), 'Abstract Art', 'L', 80, 4))
-                
-                c.executemany("INSERT INTO PRODUCTION_LOG (log_date, product_name, size, units_produced, defects) VALUES (?, ?, ?, ?, ?)", data)
+        # Check and insert mock production logs (10 days of data)
+        if not c.execute("SELECT 1 FROM PRODUCTION_LOG").fetchone():
+            today = datetime.now().date()
+            data = []
             
+            # Generate data for the last 10 days
+            for i in range(1, 11):
+                log_date = (today - timedelta(days=i)).strftime('%Y-%m-%d')
+                
+                # Design 1: Logo Tee (High volume, low defect rate)
+                data.append((log_date, 'Logo Tee', 'M', 100 + i*10, 5 + (i//3)))
+                data.append((log_date, 'Logo Tee', 'L', 120 + i*5, 4 + (i//4)))
+
+                # Design 2: Abstract Art (Medium volume, medium defect rate)
+                data.append((log_date, 'Abstract Art', 'S', 50 + i*3, 2 + (i//2)))
+                data.append((log_date, 'Abstract Art', 'XL', 70 + i*2, 3 + (i//2)))
+                
+                # Design 3: Vintage Stripes (Low volume, high defect rate simulation)
+                data.append((log_date, 'Vintage Stripes', 'M', 30 + i*2, 1 + i))
+                
+            # Add a few logs for today
+            data.append((today.strftime('%Y-%m-%d'), 'Logo Tee', 'M', 150, 6))
+            data.append((today.strftime('%Y-%m-%d'), 'Abstract Art', 'L', 80, 4))
+            
+            c.executemany("INSERT INTO PRODUCTION_LOG (log_date, product_name, size, units_produced, defects) VALUES (?, ?, ?, ?, ?)", data)
+        
+        conn.commit()
     except sqlite3.IntegrityError:
-        pass # Data already present
+        pass 
     except Exception as e:
         st.error(f"Error initializing data: {e}")
+    finally:
+        conn.close()
 
 
 # --- Authentication Functions ---
@@ -114,13 +128,13 @@ def authenticate_user(username, password):
     password_hash = hash_password(password)
     c.execute("SELECT * FROM USERS WHERE username = ? AND password_hash = ?", (username, password_hash))
     user = c.fetchone()
+    conn.close()
     return user
 
-def signup_user(username, email, password): # Removed 'role' argument
+def signup_user(username, email, password): 
     """Registers a new user, always assigning the 'customer' role."""
     conn = get_db_connection()
     
-    # Check if username or email already exists and insert using transaction context manager
     try:
         with conn:
             c = conn.cursor()
@@ -128,7 +142,6 @@ def signup_user(username, email, password): # Removed 'role' argument
                 return False, "Username or Email already exists."
             
             password_hash = hash_password(password)
-            # HARDCODE ROLE: Assign 'customer' role to all new sign-ups
             default_role = 'customer' 
             c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
                       (username, email, password_hash, default_role))
@@ -137,17 +150,17 @@ def signup_user(username, email, password): # Removed 'role' argument
         return False, "Database error during registration."
     except Exception as e:
         return False, f"An unexpected error occurred: {e}"
+    finally:
+        conn.close()
 
-# --- Data Fetching (Caching added to force refresh after DB change) ---
-# Use st.cache_data to store the returned DataFrame. The cache will be cleared when 
-# the 'Production Log Added' message is shown, triggering a chart update.
+# --- Data Fetching (Caching) ---
 @st.cache_data
-def get_production_data(cache_refresher): # Removed 'conn' argument
+def get_production_data(cache_refresher): 
     """
     Fetches production log data. 
     The 'cache_refresher' argument is only used to force a cache clear on data updates.
     """
-    conn = get_db_connection() # Get the cached connection object internally
+    conn = get_db_connection() # Get a fresh connection object for the query
     try:
         # Fetch all data from the PRODUCTION_LOG table, joining with DESIGNS to get current price
         query = """
@@ -163,9 +176,24 @@ def get_production_data(cache_refresher): # Removed 'conn' argument
         df['potential_revenue'] = df['units_produced'] * df['price_usd']
         df['log_date'] = pd.to_datetime(df['log_date'])
         return df
-    except pd.io.sql.DatabaseError:
-        st.error("Could not fetch production data.")
+    except pd.io.sql.DatabaseError as e:
+        st.error(f"Database Read Error: Could not fetch production data. {e}")
         return pd.DataFrame()
+    finally:
+        conn.close() # Close the connection after reading
+
+@st.cache_data
+def get_designs_data(cache_refresher):
+    """Fetches design data using a cacheable function."""
+    conn = get_db_connection()
+    try:
+        df_designs = pd.read_sql_query("SELECT name, description, price_usd FROM DESIGNS ORDER BY name", conn)
+        return df_designs
+    except pd.io.sql.DatabaseError as e:
+        st.error(f"Database Read Error: Could not fetch designs data. {e}")
+        return pd.DataFrame()
+    finally:
+        conn.close()
 
 
 # --- App Pages ---
@@ -202,12 +230,11 @@ def login_page():
         signup_page()
 
 def signup_page():
-    """Handles user sign-up. Role selection removed."""
+    """Handles user sign-up."""
     st.subheader("New User Sign Up")
     with st.form("signup_form"):
         st.markdown("##### Create a New Customer Account")
         new_username = st.text_input("Username", key="su_username")
-        # Email field
         new_email = st.text_input("Email", key="su_email", help="Required for notifications and identification.")
         new_password = st.text_input("Password", type="password", key="su_password")
         confirm_password = st.text_input("Confirm Password", type="password", key="su_confirm_password")
@@ -232,11 +259,9 @@ def signup_page():
 
 def performance_and_sales_page():
     """Displays improved production performance graphs and revenue metrics."""
-    # conn = get_db_connection() # Removed direct connection passing
     st.title("📈 Performance and Sales Tracking")
 
     # Use st.session_state.get('db_refresher', 0) to force cache invalidation
-    # Only passing the hashable integer refresher
     df = get_production_data(st.session_state.get('db_refresher', 0))
     
     if df.empty:
@@ -270,7 +295,6 @@ def performance_and_sales_page():
         total_revenue=('potential_revenue', 'sum') 
     ).reset_index()
     
-    # Calculate defect rate for the trend chart
     df_daily['defect_rate'] = (df_daily['total_defects'] / df_daily['total_units']) * 100
     df_daily.loc[df_daily['total_units'] == 0, 'defect_rate'] = 0 
     
@@ -280,6 +304,7 @@ def performance_and_sales_page():
     revenue_chart = alt.Chart(df_daily).mark_bar().encode(
         x=alt.X('log_date:T', axis=alt.Axis(title='Date', format='%Y-%m-%d')),
         y=alt.Y('total_revenue:Q', title='Potential Revenue (USD)'),
+        color=alt.value("#4c78a8"),
         tooltip=[
             alt.Tooltip('log_date:T', title='Date'),
             alt.Tooltip('total_revenue:Q', title='Revenue', format='$,.2f'),
@@ -299,10 +324,8 @@ def performance_and_sales_page():
                              value_name='Count')
 
     # --- Chart 2: Daily Units vs. Defects (Layered Column Chart) ---
-    # UPDATED SUBHEADER AND TITLE FOR CLARITY
     st.subheader("Daily Production Volume vs. Daily Defects (Quality Control)")
     
-    # Base chart setup
     base = alt.Chart(df_melted).encode(
         x=alt.X('log_date:T', axis=alt.Axis(title='Date', format='%Y-%m-%d')),
         tooltip=[
@@ -312,15 +335,14 @@ def performance_and_sales_page():
         ]
     )
 
-    # Use column separation for distinct charts with independent scales
     bars = base.mark_bar().encode(
         y=alt.Y('Count:Q', title='Count'),
-        color=alt.Color('Metric:N', legend=alt.Legend(title="Metric")),
+        color=alt.Color('Metric:N', legend=alt.Legend(title="Metric"), scale=alt.Scale(range=['#4c78a8', '#f58518'])),
         column=alt.Column('Metric:N', header=alt.Header(titleOrient="bottom", labelOrient="bottom")),
     ).resolve_scale(
-        y='independent' # Key: Ensures 'Units Produced' and 'Defects' have separate Y-axes
+        y='independent' 
     ).properties(
-        title='Daily Production Volume (Units) vs. Defects Recorded' # Final Updated Title
+        title='Daily Production Volume (Units) vs. Defects Recorded' 
     )
 
     st.altair_chart(bars, use_container_width=True)
@@ -332,7 +354,6 @@ def performance_and_sales_page():
 
     rate_chart = alt.Chart(df_daily).mark_line(point=True, strokeWidth=3, color='#F06E6E').encode(
         x=alt.X('log_date:T', title='Date'),
-        # Set a clear, fixed domain for a better visual comparison
         y=alt.Y('defect_rate:Q', title='Defect Rate (%)', scale=alt.Scale(domain=[0, df_daily['defect_rate'].max() * 1.2 or 5])),
         tooltip=[
             alt.Tooltip('log_date:T', title='Date'),
@@ -342,7 +363,7 @@ def performance_and_sales_page():
         ]
     ).properties(
         title='Defect Rate Percentage Over Time'
-    ).interactive() # Allow zoom and pan
+    ).interactive() 
     
     st.altair_chart(rate_chart, use_container_width=True)
 
@@ -353,7 +374,7 @@ def dashboard_page():
     if st.session_state['role'] == 'admin':
         st.header("Admin Overview")
         st.info("Use the sidebar navigation to manage products, log production, or view performance.")
-        performance_and_sales_page() # Admins see the performance tracking by default
+        performance_and_sales_page() 
         
     elif st.session_state['role'] == 'customer':
         st.header("Customer Portal")
@@ -366,10 +387,12 @@ def manage_production_page():
         st.error("Access Denied: Only Admins can manage production.")
         return
 
-    conn = get_db_connection()
+    # Use the cached function to get current designs data
+    df_designs = get_designs_data(st.session_state.get('db_refresher', 0))
+    designs = df_designs['name'].tolist()
+
     st.title("Log New Production Run")
     
-    designs = pd.read_sql_query("SELECT name FROM DESIGNS", conn)['name'].tolist()
     if not designs:
         st.warning("No designs found. Please add designs first.")
         return
@@ -387,6 +410,7 @@ def manage_production_page():
             if defects > units_produced:
                 st.error("Defects cannot exceed total units produced.")
             else:
+                conn = get_db_connection()
                 try:
                     with conn:
                         c = conn.cursor()
@@ -401,10 +425,12 @@ def manage_production_page():
                          st.session_state['db_refresher'] = 0
                     st.session_state['db_refresher'] += 1
                     
-                    st.rerun() # Rerun the script to ensure the chart page updates
+                    st.rerun() 
                     
                 except Exception as e:
                     st.error(f"Failed to log production: {e}")
+                finally:
+                    conn.close()
 
 def manage_designs_page():
     """Allows admins to add and view designs."""
@@ -412,7 +438,6 @@ def manage_designs_page():
         st.error("Access Denied: Only Admins can manage designs.")
         return
 
-    conn = get_db_connection()
     st.title("Product (Design) Management") 
     
     col1, col2 = st.columns([1, 2])
@@ -429,15 +454,23 @@ def manage_designs_page():
 
             if submitted:
                 if name:
+                    conn = get_db_connection()
                     try:
                         with conn:
                             c = conn.cursor()
                             c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", (name, description, price_usd))
-                        st.success(f"Design '{name}' added successfully!")
+                        
+                        # Invalidate the cache for design data after adding a new design
+                        st.session_state['db_refresher'] = st.session_state.get('db_refresher', 0) + 1
+                        st.success(f"Design '{name}' added successfully! Refreshing data...")
+                        st.rerun()
+                        
                     except sqlite3.IntegrityError:
                         st.error("A design with this name already exists.")
                     except Exception as e:
                         st.error(f"An error occurred: {e}")
+                    finally:
+                        conn.close()
                 else:
                     st.error("Design Name cannot be empty.")
 
@@ -446,10 +479,10 @@ def manage_designs_page():
 
 def view_designs_page():
     """Displays all available designs."""
-    conn = get_db_connection()
     st.subheader("Current T-Shirt Designs")
     
-    df_designs = pd.read_sql_query("SELECT name, description, price_usd FROM DESIGNS ORDER BY name", conn)
+    # Use the cached function to fetch design data
+    df_designs = get_designs_data(st.session_state.get('db_refresher', 0))
 
     if df_designs.empty:
         st.info("No designs have been added yet.")
@@ -485,6 +518,9 @@ def main_app():
         st.session_state['page'] = 'login'
     if 'page' not in st.session_state:
          st.session_state['page'] = 'login'
+    # Initialize db_refresher for cache invalidation
+    if 'db_refresher' not in st.session_state:
+        st.session_state['db_refresher'] = 0
 
     # --- Sidebar Navigation ---
     with st.sidebar:
@@ -500,7 +536,7 @@ def main_app():
             # Navigation based on role
             if st.session_state['role'] == 'admin':
                 st.header("Admin Menu")
-                if st.button("Dashboard", key="nav_dash"):
+                if st.button("Dashboard (Home)", key="nav_dash"):
                     st.session_state['page'] = 'dashboard'
                 if st.button("Log Production", key="nav_prod"):
                     st.session_state['page'] = 'manage_production'
@@ -511,7 +547,7 @@ def main_app():
             
             elif st.session_state['role'] == 'customer':
                 st.header("Customer Menu")
-                if st.button("Dashboard", key="nav_dash_cust"):
+                if st.button("Dashboard (Home)", key="nav_dash_cust"):
                     st.session_state['page'] = 'dashboard'
                 if st.button("View Designs", key="nav_view_design"):
                     st.session_state['page'] = 'view_designs'
