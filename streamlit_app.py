@@ -6,6 +6,7 @@ import datetime
 import pandas as pd
 from threading import Lock
 import os
+import time
 
 # Set page configuration for a better look
 st.set_page_config(page_title="Code & Thread Shop", layout="centered", initial_sidebar_state="expanded")
@@ -14,129 +15,132 @@ st.set_page_config(page_title="Code & Thread Shop", layout="centered", initial_s
 DB_NAME = 'tshirt_shop.db'
 PRODUCT_ID = 1  # Fixed ID for the single T-shirt product
 
-# --- Database Management Class (Maximum Resilience) ---
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+# --- Wholesale and Discount Helper ---
+
+def calculate_item_total(base_price, quantity):
+    """
+    Applies bulk discount for the single product (Wholesale Feature).
+    10% off for 10 or more items.
+    """
+    total = base_price * quantity
+    bulk_discount = 0.0
+    if quantity >= 10:
+        # 10% wholesale discount
+        discount_rate = 0.10
+        bulk_discount = total * discount_rate
+        total -= bulk_discount
+    return round(total, 2), round(bulk_discount, 2)
+
+
+# --- STANDALONE DATABASE INITIALIZATION FUNCTION ---
+def initialize_database(target_db_path):
+    """
+    Creates the database file and initializes all schema tables and initial data, 
+    including the new DISCOUNTS table.
+    """
+    conn = None
+    try:
+        if os.path.exists(target_db_path):
+             return
+             
+        conn = sqlite3.connect(target_db_path, check_same_thread=False, timeout=60)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        
+        with conn: 
+            schema_script = f'''
+                CREATE TABLE USERS (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT,
+                    role TEXT
+                );
+                
+                CREATE TABLE PRODUCTS (
+                    product_id INTEGER PRIMARY KEY,
+                    name TEXT,
+                    description TEXT,
+                    price REAL,
+                    stock INTEGER
+                );
+                
+                CREATE TABLE ORDERS (
+                    order_id TEXT PRIMARY KEY,
+                    username TEXT,
+                    order_date TEXT,
+                    total_amount REAL,
+                    status TEXT,
+                    full_name TEXT,
+                    address TEXT,
+                    city TEXT,
+                    zip_code TEXT,
+                    FOREIGN KEY (username) REFERENCES USERS(username)
+                );
+
+                CREATE TABLE ORDER_ITEMS (
+                    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id TEXT,
+                    product_id INTEGER,
+                    size TEXT,
+                    quantity INTEGER,
+                    unit_price REAL,
+                    FOREIGN KEY (order_id) REFERENCES ORDERS(order_id),
+                    FOREIGN KEY (product_id) REFERENCES PRODUCTS(product_id)
+                );
+                
+                -- New table for Discounts
+                CREATE TABLE DISCOUNTS (
+                    code TEXT PRIMARY KEY,
+                    discount_type TEXT, -- 'percent' or 'fixed'
+                    value REAL,
+                    is_active INTEGER
+                );
+            '''
+            c.executescript(schema_script)
+
+            # Add initial users
+            c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
+            c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
+
+            # Add initial product data
+            c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
+                    (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
+                    
+            # Add initial discount codes
+            c.execute("INSERT INTO DISCOUNTS VALUES (?, ?, ?, ?)", ('SAVE10', 'percent', 10.0, 1)) # 10% off
+            c.execute("INSERT INTO DISCOUNTS VALUES (?, ?, ?, ?)", ('FIVER', 'fixed', 5.0, 1)) # $5 off
+            c.execute("INSERT INTO DISCOUNTS VALUES (?, ?, ?, ?)", ('EXPIRED', 'percent', 20.0, 0)) # Inactive
+            
+
+    except Exception as e:
+        if os.path.exists(target_db_path):
+             os.remove(target_db_path)
+        raise Exception(f"CRITICAL DB INIT ERROR: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+# --- Database Management Class (Passive) ---
 class DBManager:
     """
-    Manages the SQLite connection and enforces thread safety using a Lock.
-    Crucially, it assumes the DB file is ALREADY fully created and initialized.
+    Manages the SQLite connection. It performs NO initialization or setup.
+    It relies entirely on the initialize_database function to run beforehand.
     """
     def __init__(self, db_path):
         self.db_path = db_path
-        # Lock for thread safety within a single process
         self._lock = Lock() 
-        # Establish connection. This MUST happen AFTER initialization is guaranteed.
         self._conn = self._get_connection() 
 
     def _get_connection(self):
         """Creates the connection with a high timeout and WAL mode."""
-        # Set connection timeout to 60 seconds (generous for a locked situation)
         conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=60)
-        # Enable write-ahead logging (WAL) for better concurrency performance
         conn.execute("PRAGMA journal_mode=WAL") 
-        conn.row_factory = sqlite3.Row # Allows column access by name
+        conn.row_factory = sqlite3.Row 
         return conn
 
-    # --- Static Initialization Method with Atomic Swap ---
-    @staticmethod
-    def _initialize_db_atomically(target_db_path):
-        """
-        Creates the database in a temporary location, initializes tables, 
-        and then moves it to the final location (target_db_path).
-        This guarantees atomicity for the schema creation across processes.
-        """
-        # 1. Use a temporary, unique file name for creation
-        db_temp_name = f'tshirt_shop_temp_{uuid.uuid4()}.db'
-        conn = None
-        
-        try:
-            # Connect to the temporary file
-            conn = sqlite3.connect(db_temp_name, check_same_thread=False, timeout=60)
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            
-            # Use a context manager for explicit transaction (atomic commit/rollback)
-            with conn: 
-                # Define all necessary tables using a single executescript for atomic schema setup
-                schema_script = f'''
-                    CREATE TABLE USERS (
-                        username TEXT PRIMARY KEY,
-                        password_hash TEXT,
-                        role TEXT
-                    );
-                    
-                    CREATE TABLE PRODUCTS (
-                        product_id INTEGER PRIMARY KEY,
-                        name TEXT,
-                        description TEXT,
-                        price REAL,
-                        stock INTEGER
-                    );
-                    
-                    CREATE TABLE ORDERS (
-                        order_id TEXT PRIMARY KEY,
-                        username TEXT,
-                        order_date TEXT,
-                        total_amount REAL,
-                        status TEXT,
-                        full_name TEXT,
-                        address TEXT,
-                        city TEXT,
-                        zip_code TEXT,
-                        FOREIGN KEY (username) REFERENCES USERS(username)
-                    );
-
-                    CREATE TABLE ORDER_ITEMS (
-                        item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        order_id TEXT,
-                        product_id INTEGER,
-                        size TEXT,
-                        quantity INTEGER,
-                        unit_price REAL,
-                        FOREIGN KEY (order_id) REFERENCES ORDERS(order_id),
-                        FOREIGN KEY (product_id) REFERENCES PRODUCTS(product_id)
-                    );
-                '''
-                c.executescript(schema_script)
-
-                # Add initial users
-                c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
-                c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
-
-                # Add initial product data
-                c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
-                        (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
-
-            # Close the connection to the temporary file
-            conn.close()
-            conn = None 
-
-            # 2. ATOMIC SWAP: Delete the old DB_NAME file and rename the temporary file
-            # This is the single, crucial atomic operation.
-            
-            # Ensure the old file and its associated WAL files are gone
-            for p in [target_db_path, target_db_path + '-wal', target_db_path + '-shm']:
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        # File is locked, which is fine, we just skip it.
-                        pass
-                        
-            # The rename is the atomic operation that completes the initialization
-            os.rename(db_temp_name, target_db_path)
-            
-        except Exception as e:
-            # Clean up the temporary file if an error occurred before the swap
-            if os.path.exists(db_temp_name):
-                os.remove(db_temp_name)
-            raise Exception(f"CRITICAL DB INIT ERROR: {e}")
-        finally:
-            if conn:
-                conn.close()
-            # Final cleanup of the temp file just in case
-            if os.path.exists(db_temp_name):
-                os.remove(db_temp_name)
-
+    # --- Data Access Methods (Using the connection) ---
 
     def execute_query(self, query, params=(), commit=False):
         """Executes a non-SELECT query with thread lock protection."""
@@ -151,7 +155,6 @@ class DBManager:
                     c.execute(query, params)
                 return c
             except sqlite3.OperationalError as e:
-                # This catches the 'database is locked' error if it somehow persists
                 raise e
             except Exception as e:
                 raise e
@@ -177,44 +180,39 @@ class DBManager:
             except Exception as e:
                 raise e
 
-# --- Global Database Manager Instance ---
+# --- Global Database Manager Instance (Protected Cache) ---
 @st.cache_resource
 def get_db_manager():
     """
-    Initializes and returns the thread-safe DBManager instance.
-    The initialization logic is separated from the DBManager class 
-    to prevent race conditions during schema creation.
+    Manages the initialization and returns the thread-safe DBManager instance.
     """
     if not os.path.exists(DB_NAME):
-        # Only perform the expensive, critical initialization/swap if the file doesn't exist
-        try:
-            # This static method handles the atomic creation and file swap.
-            DBManager._initialize_db_atomically(DB_NAME)
-        except Exception as e:
-            st.error(f"FATAL: Database initialization failed. Error: {e}")
-            # Re-raise to halt Streamlit if initialization fails.
-            raise e
+        time.sleep(1) 
+        
+        if os.path.exists(DB_NAME):
+            pass
+        else:
+            try:
+                initialize_database(DB_NAME)
+            except Exception as e:
+                st.error(f"FATAL: Database initialization failed after pause. Error: {e}")
+                raise e
 
-    # Now that the file is guaranteed to exist and be complete, safely return the Manager.
     try:
         return DBManager(DB_NAME)
     except Exception as e:
         st.error(f"Failed to connect to the finalized database. Error: {e}")
-        raise e
-
+        st.stop()
+        
 # --- Global Access to DB Manager ---
 try:
-    # Attempt to get the DB manager instance
     db_manager = get_db_manager()
 except Exception as e:
-    # If the exception propagated, stop the app execution
-    st.error("CRITICAL: Application halted due to persistent database failure. Please refresh and try again.")
+    st.error("CRITICAL: Application cannot start due to persistent database error. Please refresh and try again.")
     st.stop() 
 
-# --- Helper Functions Adapted to DBManager ---
 
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+# --- Helper Functions (using the new passive DBManager) ---
 
 def verify_user(username, password):
     try:
@@ -241,7 +239,6 @@ def add_user(username, password):
 
 def get_product_details(product_id):
     try:
-        # This function caused the failure, but should be safe now.
         products = db_manager.fetch_query("SELECT * FROM PRODUCTS WHERE product_id = ?", (product_id,))
         if products:
             row = products[0]
@@ -251,7 +248,18 @@ def get_product_details(product_id):
         return None
     return None
 
-def place_order(username, cart_items, total_amount, full_name, address, city, zip_code):
+def get_discount(code):
+    """Fetches active coupon details from the database."""
+    try:
+        results = db_manager.fetch_query("SELECT discount_type, value FROM DISCOUNTS WHERE code = ? AND is_active = 1", (code,))
+        if results:
+            return dict(results[0])
+        return None
+    except Exception:
+        return None
+
+
+def place_order(username, cart_items, final_amount, full_name, address, city, zip_code):
     order_id = str(uuid.uuid4())
     order_date = datetime.datetime.now().isoformat()
 
@@ -261,14 +269,16 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
             c = conn.cursor()
             
             with conn: 
+                # Use final_amount calculated in checkout_page
                 c.execute("INSERT INTO ORDERS (order_id, username, order_date, total_amount, status, full_name, address, city, zip_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (order_id, username, order_date, total_amount, 'Processing', full_name, address, city, zip_code))
+                        (order_id, username, order_date, final_amount, 'Processing', full_name, address, city, zip_code))
 
                 for item in cart_items:
                     c.execute("SELECT stock FROM PRODUCTS WHERE product_id = ?", (item['product_id'],))
                     product_stock = c.fetchone()
                     
                     if product_stock and product_stock[0] >= item['quantity']:
+                        # unit_price here is the original product price for accounting
                         c.execute("INSERT INTO ORDER_ITEMS (order_id, product_id, size, quantity, unit_price) VALUES (?, ?, ?, ?, ?)",
                                 (order_id, item['product_id'], item['size'], item['quantity'], item['price']))
 
@@ -332,7 +342,6 @@ def login_page():
 def product_page():
     st.title("T-Shirt Store")
 
-    # Fetch product details
     product = get_product_details(PRODUCT_ID)
     if not product:
         st.error("Product details are currently unavailable. The database may still be initializing. Please refresh.")
@@ -342,8 +351,8 @@ def product_page():
     st.write(product['description'])
     st.markdown(f"**Price:** ${product['price']:.2f}")
     st.markdown(f"**Stock:** {product['stock']} available")
+    st.info("Wholesale pricing: 10% off when buying 10 or more items!")
 
-    # Image placeholder
     st.image("https://placehold.co/400x400/36454F/FFFFFF?text=Awesome+Code+Tee", caption="Our Awesome T-Shirt Design", use_column_width=False)
 
     st.subheader("Select Options")
@@ -357,14 +366,10 @@ def product_page():
         size = st.selectbox("Size", ['S', 'M', 'L', 'XL'], index=1, key="select_size")
     
     with col_qty:
-        # Calculate max quantity based on current stock
         max_qty = product['stock'] 
-        
-        # Check if item is already in cart to set default quantity
         existing_item = next((item for item in st.session_state['cart'] if item['product_id'] == PRODUCT_ID and item['size'] == size), None)
         default_qty = existing_item['quantity'] if existing_item else 1
         
-        # Ensure default_qty doesn't exceed max_qty
         if default_qty > max_qty:
             default_qty = max_qty
             
@@ -374,21 +379,24 @@ def product_page():
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("Add to Cart"):
             if quantity > 0 and quantity <= max_qty:
+                
+                new_total, bulk_discount = calculate_item_total(product['price'], quantity)
+
                 new_item = {
                     'product_id': PRODUCT_ID,
                     'name': product['name'],
                     'size': size,
                     'quantity': quantity,
-                    'price': product['price'],
-                    'total': quantity * product['price']
+                    'price': product['price'], # Original unit price
+                    'total': new_total, # Total after bulk discount
+                    'bulk_discount': bulk_discount
                 }
 
                 cart_updated = False
                 for i in range(len(st.session_state['cart'])):
                     item = st.session_state['cart'][i]
                     if item['product_id'] == PRODUCT_ID and item['size'] == size:
-                        st.session_state['cart'][i]['quantity'] = quantity
-                        st.session_state['cart'][i]['total'] = quantity * item['price']
+                        st.session_state['cart'][i].update(new_item) # Update existing item
                         cart_updated = True
                         break
                 
@@ -409,44 +417,115 @@ def checkout_page():
             st.rerun()
         return
 
+    # --- Step 1: Order Summary and Shipping ---
     st.subheader("Order Summary")
-    if not st.session_state['cart']:
-        st.warning("Your cart is empty.")
-        return
         
     cart_df = pd.DataFrame(st.session_state['cart'])
+    # Show bulk discount clearly
     cart_df['Unit Price'] = cart_df['price'].apply(lambda x: f"${x:.2f}")
-    cart_df['Total Price'] = cart_df['total'].apply(lambda x: f"${x:.2f}")
-    display_cols = ['name', 'size', 'quantity', 'Unit Price', 'Total Price']
+    cart_df['Subtotal'] = (cart_df['price'] * cart_df['quantity']).apply(lambda x: f"${x:.2f}")
+    cart_df['Bulk Discount'] = cart_df['bulk_discount'].apply(lambda x: f"- ${x:.2f}")
+    cart_df['Final Total'] = cart_df['total'].apply(lambda x: f"${x:.2f}")
+    
+    display_cols = ['name', 'size', 'quantity', 'Unit Price', 'Bulk Discount', 'Final Total']
     st.dataframe(cart_df[display_cols], hide_index=True, use_container_width=True)
 
-    total_amount = cart_df['total'].sum()
-    st.markdown(f"### Grand Total: **${total_amount:.2f}**")
+    subtotal_amount = cart_df['total'].sum()
+    
+    # Initialize discount states
+    if 'coupon_code' not in st.session_state:
+        st.session_state['coupon_code'] = ''
+        st.session_state['coupon_discount'] = 0.0
+        st.session_state['coupon_valid'] = False
+
+    # --- Step 2: Discount Application ---
+    st.subheader("Apply Coupon Code")
+    col_code, col_apply = st.columns([2, 1])
+
+    with col_code:
+        coupon_input = st.text_input("Coupon Code", value=st.session_state['coupon_code'].upper(), max_chars=10, key="coupon_input")
+    
+    with col_apply:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("Apply Discount"):
+            st.session_state['coupon_code'] = coupon_input.upper()
+            discount_data = get_discount(st.session_state['coupon_code'])
+            
+            if discount_data:
+                if discount_data['discount_type'] == 'percent':
+                    discount_value = subtotal_amount * (discount_data['value'] / 100)
+                elif discount_data['discount_type'] == 'fixed':
+                    discount_value = discount_data['value']
+                
+                st.session_state['coupon_discount'] = round(discount_value, 2)
+                st.session_state['coupon_valid'] = True
+                st.success(f"Coupon '{st.session_state['coupon_code']}' applied! Discount: -${st.session_state['coupon_discount']:.2f}")
+                st.rerun()
+            else:
+                st.session_state['coupon_discount'] = 0.0
+                st.session_state['coupon_valid'] = False
+                st.error("Invalid or expired coupon code. Try 'SAVE10' or 'FIVER'.")
+                st.rerun()
+    
+    final_payable = subtotal_amount - st.session_state['coupon_discount']
+    
+    st.markdown("---")
+    st.metric("Total Before Coupon", f"${subtotal_amount:.2f}")
+    if st.session_state['coupon_discount'] > 0:
+        st.metric("Coupon Discount", f"- ${st.session_state['coupon_discount']:.2f}")
+    st.markdown(f"## Final Payable: **${final_payable:.2f}**")
     
     st.subheader("Shipping Information")
 
-    with st.form("checkout_form"):
-        default_name = st.session_state.get('username', '').capitalize() or ""
+    # Use session state to persist shipping info between reruns
+    if 'shipping_info' not in st.session_state:
+        st.session_state['shipping_info'] = {
+            'full_name': st.session_state.get('username', '').capitalize() or "",
+            'address': '',
+            'city': '',
+            'zip_code': ''
+        }
 
-        full_name = st.text_input("Full Name", value=default_name, required=True, key="checkout_full_name")
-        address = st.text_area("Shipping Address", required=True, key="checkout_address")
-        
-        col_city, col_zip = st.columns(2)
-        with col_city:
-            city = st.text_input("City", required=True, key="checkout_city")
-        with col_zip:
-            zip_code = st.text_input("Zip Code", required=True, key="checkout_zip")
-        
-        submitted = st.form_submit_button("Complete Order")
+    # Store inputs directly to session state on change
+    full_name = st.text_input("Full Name", value=st.session_state['shipping_info']['full_name'], required=True, key="checkout_full_name")
+    address = st.text_area("Shipping Address", value=st.session_state['shipping_info']['address'], required=True, key="checkout_address")
+    
+    col_city, col_zip = st.columns(2)
+    with col_city:
+        city = st.text_input("City", value=st.session_state['shipping_info']['city'], required=True, key="checkout_city")
+    with col_zip:
+        zip_code = st.text_input("Zip Code", value=st.session_state['shipping_info']['zip_code'], required=True, key="checkout_zip")
+    
+    st.session_state['shipping_info'].update({
+        'full_name': full_name, 'address': address, 'city': city, 'zip_code': zip_code
+    })
 
-        if submitted:
-            if not all([full_name, address, city, zip_code]):
-                st.error("Please fill in all shipping fields.")
+    # --- Step 3: Fake Payment Gateway ---
+    st.subheader("Payment Details (Simulated Gateway)")
+    
+    if not all([full_name, address, city, zip_code]):
+        st.warning("Please fill in shipping information to proceed to payment.")
+        return
+
+    with st.form("payment_form"):
+        st.markdown("Enter fake payment details below.")
+        card_number = st.text_input("Card Number", max_chars=16)
+        col_exp, col_cvv = st.columns(2)
+        with col_exp:
+             expiration = st.text_input("Expiration Date (MM/YY)", max_chars=5)
+        with col_cvv:
+            cvv = st.text_input("CVV", type="password", max_chars=4)
+        
+        pay_button = st.form_submit_button(f"Pay ${final_payable:.2f} and Place Order", type="primary")
+
+        if pay_button:
+            if len(card_number) < 15 or len(expiration) != 5 or len(cvv) < 3:
+                st.error("Please enter valid (fake) payment details to simulate a successful transaction.")
             else:
                 success, result = place_order(
                     st.session_state['username'],
                     st.session_state['cart'],
-                    total_amount,
+                    final_payable, # Pass the final calculated amount
                     full_name,
                     address,
                     city,
@@ -454,8 +533,10 @@ def checkout_page():
                 )
                 
                 if success:
-                    st.success(f"Order successfully placed! Your Order ID is: {result}")
+                    st.success(f"Payment successful! Order successfully placed! Your Order ID is: {result}")
                     st.session_state['cart'] = []
+                    st.session_state['coupon_discount'] = 0.0
+                    st.session_state['coupon_code'] = ''
                     st.balloons()
                     st.session_state['page'] = 'order_complete'
                     st.session_state['last_order_id'] = result
@@ -480,7 +561,7 @@ def dashboard_page():
 
     try:
         # Fetch orders for the current user
-        df_orders = db_manager.fetch_query_df("SELECT order_id, order_date, total_amount, status, full_name, address, city, zip_code FROM ORDERS WHERE username = ? ORDER BY order_date DESC", 
+        df_orders = db_manager.fetch_query_df("SELECT order_id, order_date, total_amount, status FROM ORDERS WHERE username = ? ORDER BY order_date DESC", 
                                       params=(st.session_state['username'],))
     except Exception as e:
         st.error(f"Could not retrieve orders. Database error: {e}")
@@ -498,13 +579,39 @@ def dashboard_page():
         st.subheader("Admin Panel")
         
         # Fetch all orders for admin
-        df_all_orders = db_manager.fetch_query_df("SELECT order_id, username, order_date, total_amount, status, full_name, address, city, zip_code FROM ORDERS ORDER BY order_date DESC")
-        st.markdown("#### All Orders")
-        st.dataframe(df_all_orders, hide_index=True, use_container_width=True)
+        df_all_orders = db_manager.fetch_query_df("SELECT order_id, username, order_date, total_amount, status, full_name FROM ORDERS ORDER BY order_date DESC")
+        
+        # --- Admin Charts Section ---
+        st.markdown("### 📊 Sales Analytics")
+        
+        if not df_all_orders.empty:
+            # Prepare data: Ensure order_date is a proper date type for charting
+            df_all_orders['order_date'] = pd.to_datetime(df_all_orders['order_date']).dt.date
+            
+            # 1. Daily Sales Over Time (Line Chart)
+            sales_daily = df_all_orders.groupby('order_date')['total_amount'].sum().reset_index()
+            sales_daily.rename(columns={'total_amount': 'Daily Sales'}, inplace=True)
+            
+            st.markdown("#### Daily Sales Total")
+            st.line_chart(sales_daily, x='order_date', y='Daily Sales')
+            
+            # 2. Order Status Distribution (Bar Chart)
+            status_counts = df_all_orders['status'].value_counts().reset_index()
+            status_counts.columns = ['Status', 'Count']
+            
+            st.markdown("#### Order Status Breakdown")
+            st.bar_chart(status_counts, x='Status', y='Count')
+            
+        else:
+            st.info("No sales data available for charts.")
+            
+        st.markdown("#### Raw Data Tables")
+        st.markdown("##### All Orders")
+        st.dataframe(df_all_orders[['order_id', 'username', 'order_date', 'total_amount', 'status']], hide_index=True, use_container_width=True)
         
         # Fetch product stock for admin
         df_products = db_manager.fetch_query_df("SELECT product_id, name, price, stock FROM PRODUCTS")
-        st.markdown("#### Product Stock")
+        st.markdown("##### Product Stock")
         st.dataframe(df_products, hide_index=True, use_container_width=True)
 
 # --- Main App Logic ---
@@ -512,7 +619,6 @@ def dashboard_page():
 def main_app():
     """The main entry point for the Streamlit application."""
 
-    # 1. Initialize session state variables
     if 'logged_in' not in st.session_state:
         st.session_state['logged_in'] = False
         st.session_state['page'] = 'login' 
@@ -562,7 +668,7 @@ def main_app():
         elif st.session_state['page'] == 'order_complete':
             order_complete_page()
         else:
-            product_page() # Default to shop page
+            product_page()
     else:
         login_page()
 
@@ -571,5 +677,4 @@ if __name__ == '__main__':
     try:
         main_app()
     except Exception as e:
-        # Catch unexpected errors in the main loop
         st.error(f"An unexpected application error occurred. Please refresh the page. Error: {e}")
