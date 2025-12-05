@@ -209,7 +209,8 @@ def admin_add_product():
     st.markdown("### 👕 Add New T-Shirt Product")
     with st.form("add_product_form"):
         name = st.text_input("Product Name")
-        price = st.number_input("Price ($)", min_value=0.01, format="%.2f")
+        # CHANGED: Replaced $ with ₹ in the label
+        price = st.number_input("Price (₹)", min_value=0.01, format="%.2f")
         size = st.selectbox("Size", ["XS", "S", "M", "L", "XL", "XXL"])
         image_url = st.text_input("Image URL (e.g., placeholder)")
         if st.form_submit_button("Add Product"):
@@ -238,7 +239,9 @@ def display_admin_inventory():
     df = admin_view_inventory(st.session_state.product_version)
     
     if df.empty: st.info("The inventory is currently empty.")
-    else: st.dataframe(df, column_config={"price": st.column_config.NumberColumn("Price ($)", format="$%.2f")}, hide_index=True)
+    else: 
+        # CHANGED: Replaced $ with ₹ in column configuration
+        st.dataframe(df, column_config={"price": st.column_config.NumberColumn("Price (₹)", format="₹%.2f")}, hide_index=True)
 
 
 # --- CUSTOMER FEATURES ---
@@ -350,7 +353,8 @@ def customer_checkout(cart_df):
         # Display cart with remove buttons
         st.dataframe(
             cart_df[['name', 'size', 'quantity', 'price']],
-            column_config={"price": st.column_config.NumberColumn("Price ($)", format="$%.2f")},
+            # CHANGED: Replaced $ with ₹ in column configuration
+            column_config={"price": st.column_config.NumberColumn("Price (₹)", format="₹%.2f")},
             hide_index=True
         )
         
@@ -384,10 +388,13 @@ def customer_checkout(cart_df):
             total = total_post_discount # Use the discounted total
             
             st.markdown(f"**Coupon Applied:** `{st.session_state.coupon_code}` ({int(st.session_state.discount_rate * 100)}% off)")
-            st.metric("Discount Applied", f"- ${discount_amount:.2f}")
-            st.metric("Final Payable", f"${total_post_discount:.2f}", delta=f"-{int(st.session_state.discount_rate * 100)}%")
+            # CHANGED: Replaced $ with ₹ in metric display
+            st.metric("Discount Applied", f"- ₹{discount_amount:.2f}")
+            # CHANGED: Replaced $ with ₹ in metric display
+            st.metric("Final Payable", f"₹{total_post_discount:.2f}", delta=f"-{int(st.session_state.discount_rate * 100)}%")
         else:
-             st.metric("Total Payable", f"${total_pre_discount:.2f}")
+             # CHANGED: Replaced $ with ₹ in metric display
+             st.metric("Total Payable", f"₹{total_pre_discount:.2f}")
 
         st.markdown("---")
 
@@ -498,7 +505,8 @@ def customer_browse_products():
         with col.container(border=True):
             st.image(row['image_url'], caption=row['name'], width=150)
             st.markdown(f"**{row['name']}**")
-            st.markdown(f"**Price:** \${row['price']:.2f} | **Size:** {row['size']}")
+            # CHANGED: Replaced $ with ₹ in price display
+            st.markdown(f"**Price:** ₹{row['price']:.2f} | **Size:** {row['size']}")
             
             # Button to navigate to Product Detail View
             if col.button("View Details", key=f"view_detail_{row['id']}"):
@@ -534,7 +542,8 @@ def product_detail_view():
         st.image(product['image_url'], caption=product['name'], use_column_width=True)
 
     with col_info:
-        st.metric("Price", f"${product['price']:.2f}")
+        # CHANGED: Replaced $ with ₹ in metric display
+        st.metric("Price", f"₹{product['price']:.2f}")
         st.markdown(f"**Description:** High-quality T-shirt made from organic cotton.")
         
         # Allow selection of quantity
@@ -585,7 +594,8 @@ def user_profile_view():
             order_history_df,
             column_config={
                 "order_id": "Order ID",
-                "total_amount": st.column_config.NumberColumn("Total Paid ($)", format="$%.2f"),
+                # CHANGED: Replaced $ with ₹ in column configuration
+                "total_amount": st.column_config.NumberColumn("Total Paid (₹)", format="₹%.2f"),
                 "tracking_id": "Tracking ID",
                 "order_date": "Date Placed",
             },
@@ -641,7 +651,8 @@ def main_app():
                     st.markdown("Your cart is empty.")
                 else:
                     total = (cart_df['price'] * cart_df['quantity']).sum()
-                    st.metric("Total", f"${total:.2f}")
+                    # CHANGED: Replaced $ with ₹ in metric display
+                    st.metric("Total", f"₹{total:.2f}")
 
                     if st.button("Proceed to Checkout", key="buy_btn", type="primary"):
                         st.session_state.checkout_stage = 'payment'
