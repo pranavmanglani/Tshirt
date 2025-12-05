@@ -5,6 +5,8 @@ import hashlib
 import random
 import time 
 
+# i love cheri cheri lady
+
 # --- CONFIGURATION & UTILITIES ---
 
 st.set_page_config(
