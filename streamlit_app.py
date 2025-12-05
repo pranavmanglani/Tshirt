@@ -23,18 +23,16 @@ def hash_password(password):
 def get_db_connection_and_init():
     """
     Initializes the database, creates tables, and returns a thread-safe connection.
-    This function must be idempotent (safe to call multiple times).
+    This function is now highly robust against database locks using a timeout.
     """
-    
+    conn = None
     try:
-        # 1. Establish Connection (set check_same_thread=False for Streamlit environment)
-        # We ensure a new connection is established safely inside the cached function.
-        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+        # 1. Establish Connection with a long timeout (10 seconds)
+        # This gives time for competing processes to finish their transactions.
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False, timeout=10)
         c = conn.cursor()
 
-        # 2. Define all necessary tables
-        # Using separate CREATE TABLE statements for robustness instead of executescript
-        # to ensure each table command is executed distinctly.
+        # 2. Define all necessary tables (Explicit CREATE TABLE statements for robustness)
         c.execute('''
             CREATE TABLE IF NOT EXISTS USERS (
                 username TEXT PRIMARY KEY,
@@ -60,7 +58,6 @@ def get_db_connection_and_init():
                 order_date TEXT,
                 total_amount REAL,
                 status TEXT,
-                -- Added shipping details as per checkout form
                 full_name TEXT,
                 address TEXT,
                 city TEXT,
@@ -69,12 +66,11 @@ def get_db_connection_and_init():
             )
         ''')
 
-        # The column that was missing: product_id must be correctly referenced here.
         c.execute('''
             CREATE TABLE IF NOT EXISTS ORDER_ITEMS (
                 item_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 order_id TEXT,
-                product_id INTEGER, -- CRITICAL: Ensure this column exists
+                product_id INTEGER,
                 size TEXT,
                 quantity INTEGER,
                 unit_price REAL,
@@ -101,14 +97,19 @@ def get_db_connection_and_init():
         return conn
     
     except sqlite3.OperationalError as e:
-        # If any OperationalError (like database lock) occurs during setup, 
-        # we clear the cache and force a restart to clear the lock.
-        st.error("Database initialization failed due to a lock. Clearing cache and restarting...")
+        # Crucial step: Explicitly close the connection to release the lock handle
+        if conn:
+            conn.close()
+        
+        # Clear the cache and force a restart to try again
+        st.error(f"Database initialization failed due to a lock ({e}). Clearing cache and restarting...")
         st.cache_resource.clear()
         st.rerun()
         return None
+        
     except Exception as e:
-        # Handle generic unexpected errors during initialization
+        if conn:
+            conn.close()
         st.error(f"Critical error during database setup: {e}. Clearing cache.")
         st.cache_resource.clear()
         st.rerun()
@@ -147,7 +148,6 @@ def add_user(username, password):
 def get_product_details(product_id):
     conn = get_db_connection()
     c = conn.cursor()
-    # Ensure this query runs safely
     try:
         c.execute("SELECT * FROM PRODUCTS WHERE product_id = ?", (product_id,))
         row = c.fetchone()
@@ -158,7 +158,6 @@ def get_product_details(product_id):
         return None
     return None
 
-# Updated place_order signature to save shipping details
 def place_order(username, cart_items, total_amount, full_name, address, city, zip_code):
     conn = get_db_connection()
     c = conn.cursor()
@@ -166,7 +165,7 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
     order_date = datetime.datetime.now().isoformat()
 
     try:
-        # 1. Insert into ORDERS table (Now includes shipping fields)
+        # 1. Insert into ORDERS table 
         c.execute("INSERT INTO ORDERS (order_id, username, order_date, total_amount, status, full_name, address, city, zip_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                   (order_id, username, order_date, total_amount, 'Processing', full_name, address, city, zip_code))
 
@@ -266,7 +265,6 @@ def product_page():
         size = st.selectbox("Size", ['S', 'M', 'L', 'XL'], index=1, key="select_size")
     
     with col_qty:
-        # Find quantity of this specific size in the cart for default value
         existing_item = next((item for item in st.session_state['cart'] if item['product_id'] == PRODUCT_ID and item['size'] == size), None)
         default_qty = existing_item['quantity'] if existing_item else 1
         quantity = st.number_input("Quantity", min_value=1, max_value=product['stock'], value=default_qty, step=1, key="select_quantity")
@@ -287,7 +285,6 @@ def product_page():
                 cart_updated = False
                 for i in range(len(st.session_state['cart'])):
                     item = st.session_state['cart'][i]
-                    # Check for exact product ID AND size match
                     if item['product_id'] == PRODUCT_ID and item['size'] == size:
                         st.session_state['cart'][i]['quantity'] = quantity
                         st.session_state['cart'][i]['total'] = quantity * item['price']
@@ -312,7 +309,6 @@ def checkout_page():
         return
 
     st.subheader("Order Summary")
-    # Handle the case where cart is present but empty (though warning above should catch it)
     if not st.session_state['cart']:
         st.warning("Your cart is empty.")
         return
@@ -382,32 +378,27 @@ def dashboard_page():
     conn = get_db_connection()
 
     try:
-        # Retrieve necessary columns from ORDERS
         df_orders = pd.read_sql_query("SELECT order_id, order_date, total_amount, status, full_name, address, city, zip_code FROM ORDERS WHERE username = ? ORDER BY order_date DESC", 
                                       conn, params=(st.session_state['username'],))
     except pd.io.sql.DatabaseError as e:
-        # Explicitly catch the error if the column is missing at runtime
-        st.error(f"Could not retrieve orders. Database schema error: {e}")
-        st.info("The application will attempt to re-initialize the database on the next load. Please try refreshing.")
+        st.error(f"Could not retrieve orders. Database error: {e}")
+        st.info("Please try refreshing the page.")
         return
 
     if df_orders.empty:
         st.info("You have no past orders.")
     else:
         st.subheader("Your Order History")
-        # Display only core order info for simplicity in the main view
         display_cols = ['order_id', 'order_date', 'total_amount', 'status']
         st.dataframe(df_orders[display_cols], hide_index=True, use_container_width=True)
 
     if st.session_state['username'] == 'admin':
         st.subheader("Admin Panel")
         
-        # Load all orders (with shipping info for admin)
         df_all_orders = pd.read_sql_query("SELECT * FROM ORDERS", conn)
         st.markdown("#### All Orders")
         st.dataframe(df_all_orders, hide_index=True, use_container_width=True)
         
-        # Load products
         df_products = pd.read_sql_query("SELECT * FROM PRODUCTS", conn)
         st.markdown("#### Product Stock")
         st.dataframe(df_products, hide_index=True, use_container_width=True)
@@ -420,8 +411,7 @@ def main_app():
     # 1. Initialize DB Connection using the cached function
     conn = get_db_connection_and_init() 
     if conn is None:
-        # get_db_connection_and_init handles its own errors and reruns, 
-        # so if it returns None, we stop execution here.
+        # If initialization fails and returns None, the app stops here.
         return 
 
     # 2. Initialize session state variables
@@ -481,9 +471,7 @@ def main_app():
 
 # The execution point of the script
 if __name__ == '__main__':
-    # Wrap main_app in a try/except for a clean display on unexpected errors
     try:
         main_app()
     except Exception as e:
-        # A friendly message for the user, while the cache clearing happens inside the DB function
         st.error(f"An unexpected error occurred during application runtime. Please refresh the page. Error: {e}")
