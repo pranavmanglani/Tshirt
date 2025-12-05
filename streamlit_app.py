@@ -5,7 +5,7 @@ import pandas as pd
 import altair as alt
 from datetime import datetime, timedelta
 import threading
-import json # Import json for handling the cart data
+import json 
 
 # --- Configuration ---
 st.set_page_config(layout="wide", page_title="T-Shirt Production Tracker", page_icon="👕")
@@ -301,8 +301,8 @@ def login_page():
     with col1:
         st.subheader("Existing User Login")
         with st.form("login_form"):
-            username = st.text_input("Username", value="admin") # Pre-fill for ease of use
-            password = st.text_input("Password", type="password", value="adminpass") # Pre-fill for ease of use
+            username = st.text_input("Username", value="customer1") # Pre-fill for ease of use
+            password = st.text_input("Password", type="password", value="customerpass") # Pre-fill for ease of use
             login_submitted = st.form_submit_button("Log In")
 
             if login_submitted:
@@ -367,7 +367,6 @@ def performance_and_sales_page():
         st.warning("No production data available. Log a production run to see the charts.")
         return
         
-    # [Rest of the performance_and_sales_page function remains the same as previous step]
     # --- 1. Top Level Metrics (Revenue and Volume) ---
     total_revenue = df['potential_revenue'].sum()
     total_units_produced = df['units_produced'].sum()
@@ -533,7 +532,7 @@ def performance_and_sales_page():
     ).interactive() 
     
     st.altair_chart(rate_chart, use_container_width=True)
-
+    
     st.markdown("---")
 
     # --- Chart 5: Product Contribution to Revenue (Pie Chart) ---
@@ -587,7 +586,6 @@ def manage_production_page():
         st.error("Access Denied: Only Admins can manage production.")
         return
         
-    # [Rest of the manage_production_page function remains the same as previous step]
     # Use the cached function to get current designs data
     df_designs = get_designs_data(st.session_state.get('db_refresher', 0))
     designs = df_designs['name'].tolist()
@@ -643,7 +641,6 @@ def manage_designs_page():
         st.error("Access Denied: Only Admins can manage designs.")
         return
         
-    # [Rest of the manage_designs_page function remains the same as previous step]
     st.title("Product (Design) Management") 
     
     col1, col2 = st.columns([1, 2])
@@ -684,7 +681,7 @@ def manage_designs_page():
                 else:
                     st.error("Design Name cannot be empty.")
 
-# --- NEW: Product Detail View with Cart Functionality ---
+# --- Product Detail View with Cart Functionality ---
 def product_detail_page(design_name):
     """Displays the detail page for a single design and allows adding to cart."""
     df_designs = get_designs_data(st.session_state.get('db_refresher', 0))
@@ -867,9 +864,79 @@ def view_cart_page():
         if st.button("Clear Cart", key="clear_cart_btn", type="secondary", use_container_width=True):
             clear_cart()
     with col_btn3:
-        if st.button("Proceed to Checkout (Simulated)", key="checkout_btn", type="primary", use_container_width=True):
-            st.success(f"Checkout Simulated! Total order value: ${total_price:,.2f}. Thank you for your order, {st.session_state['username']}!")
-            clear_cart()
+        # MODIFICATION: Redirect to a dedicated checkout page
+        if st.button("Proceed to Checkout", key="checkout_btn", type="primary", use_container_width=True):
+            st.session_state['page'] = 'checkout'
+            st.rerun()
+
+# --- NEW: Dedicated Checkout Page ---
+def checkout_page():
+    """Simulated dedicated checkout page."""
+    st.title("💳 Checkout")
+    
+    cart = st.session_state.get('cart', [])
+    if not cart:
+        st.warning("Your cart is empty. Please add items to proceed to checkout.")
+        if st.button("Go to Collections"):
+            st.session_state['page'] = 'view_product_collections'
+            st.rerun()
+        return
+        
+    cart_df = pd.DataFrame(cart)
+    total_price = cart_df['subtotal'].sum()
+
+    st.subheader("Order Summary")
+    st.dataframe(
+        cart_df[['name', 'size', 'quantity', 'subtotal']],
+        column_config={
+            "name": "Product",
+            "size": "Size",
+            "quantity": "Qty",
+            "subtotal": st.column_config.NumberColumn("Subtotal", format="$%.2f")
+        },
+        hide_index=True,
+        use_container_width=True
+    )
+    
+    st.markdown("---")
+    st.markdown(f"## Final Total: **${total_price:,.2f}**")
+    st.markdown("---")
+
+    # --- Shipping and Payment Form Simulation ---
+    with st.form("checkout_form"):
+        st.subheader("1. Shipping Information")
+        st.text_input("Full Name", value=st.session_state['username'].capitalize(), required=True)
+        st.text_area("Shipping Address", required=True)
+        # Use the customer's email if available, otherwise mock one
+        email = next((user['email'] for user in [authenticate_user(st.session_state['username'], 'customerpass')] if user), "default@email.com")
+        st.text_input("Email", value=email, required=True)
+        
+        st.subheader("2. Payment Details (Simulated)")
+        st.selectbox("Payment Method", ["Credit Card", "PayPal", "Bank Transfer"], index=0)
+        st.text_input("Card Number", placeholder="XXXX XXXX XXXX XXXX")
+        col_exp, col_cvv = st.columns(2)
+        with col_exp:
+            st.text_input("Expiry Date", placeholder="MM/YY")
+        with col_cvv:
+            st.text_input("CVV", placeholder="XXX", type="password")
+            
+        st.markdown("---")
+        
+        # Confirmation button
+        submit_order = st.form_submit_button(f"Place Order and Pay ${total_price:,.2f}", type="primary")
+
+        if submit_order:
+            # This is the actual final action
+            st.success(f"Order successfully placed! Total paid: ${total_price:,.2f}. You will receive a confirmation email shortly.")
+            st.balloons()
+            # Clear the cart and redirect to a thank you/collections page
+            st.session_state['cart'] = []
+            st.session_state['page'] = 'view_product_collections'
+            st.rerun()
+            
+    if st.button("← Return to Cart"):
+        st.session_state['page'] = 'view_cart'
+        st.rerun()
 
 
 def logout():
@@ -973,6 +1040,9 @@ def main_app():
         view_product_collections()
     elif st.session_state['page'] == 'view_cart':
         view_cart_page()
+    # NEW ROUTE: Dedicated Checkout Page
+    elif st.session_state['page'] == 'checkout':
+        checkout_page()
 
 if __name__ == '__main__':
     main_app()
