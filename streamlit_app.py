@@ -733,7 +733,7 @@ def view_product_collections():
             
             st.markdown("---")
             st.warning("To place a bulk order, please contact our sales team using the information below.")
-            st.markdown("Email: `sales@tshirtco.com` | Phone: `(555) 555-5555`")
+            st.markdown("Email: `tanisk@gmail.com`")
 
 
 def logout():
