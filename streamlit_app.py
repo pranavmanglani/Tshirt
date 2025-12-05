@@ -17,97 +17,75 @@ PRODUCT_ID = 1  # Fixed ID for the single T-shirt product
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-# FIX: Use @st.cache_resource to ensure the database connection and
-# initialization happen only once, preventing 'database is locked' errors.
-# We explicitly handle OperationalError inside this function for robustness.
-@st.cache_resource(show_spinner=False) # Hiding spinner as this runs on every load
+# FIX: @st.cache_resource is the right tool, but we must make the function 
+# entirely passive and database-focused, removing all internal st. calls 
+# and relying on explicit SELECTs instead of catching IntegrityError, 
+# which can sometimes be mistaken for OperationalError.
+@st.cache_resource(show_spinner=False)
 def get_db_connection_and_init():
     """Initializes the database, creates tables, populates initial data,
     and returns a thread-safe connection object."""
     
-    try:
-        # 1. Establish Connection (set check_same_thread=False for Streamlit environment)
-        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-        c = conn.cursor()
+    # 1. Establish Connection (set check_same_thread=False for Streamlit environment)
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    c = conn.cursor()
 
-        # 2. Define all necessary tables (This part is fast and safe)
-        c.executescript('''
-            CREATE TABLE IF NOT EXISTS USERS (
-                username TEXT PRIMARY KEY,
-                password_hash TEXT,
-                role TEXT
-            );
+    # 2. Define all necessary tables (This part is fast and safe)
+    c.executescript('''
+        CREATE TABLE IF NOT EXISTS USERS (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT,
+            role TEXT
+        );
 
-            CREATE TABLE IF NOT EXISTS PRODUCTS (
-                product_id INTEGER PRIMARY KEY,
-                name TEXT,
-                description TEXT,
-                price REAL,
-                stock INTEGER
-            );
+        CREATE TABLE IF NOT EXISTS PRODUCTS (
+            product_id INTEGER PRIMARY KEY,
+            name TEXT,
+            description TEXT,
+            price REAL,
+            stock INTEGER
+        );
 
-            CREATE TABLE IF NOT EXISTS ORDERS (
-                order_id TEXT PRIMARY KEY,
-                username TEXT,
-                order_date TEXT,
-                total_amount REAL,
-                status TEXT,
-                FOREIGN KEY (username) REFERENCES USERS(username)
-            );
+        CREATE TABLE IF NOT EXISTS ORDERS (
+            order_id TEXT PRIMARY KEY,
+            username TEXT,
+            order_date TEXT,
+            total_amount REAL,
+            status TEXT,
+            FOREIGN KEY (username) REFERENCES USERS(username)
+        );
 
-            CREATE TABLE IF NOT EXISTS ORDER_ITEMS (
-                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id TEXT,
-                product_id INTEGER,
-                size TEXT,
-                quantity INTEGER,
-                unit_price REAL,
-                FOREIGN KEY (order_id) REFERENCES ORDERS(order_id),
-                FOREIGN KEY (product_id) REFERENCES PRODUCTS(product_id)
-            );
-        ''')
+        CREATE TABLE IF NOT EXISTS ORDER_ITEMS (
+            item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id TEXT,
+            product_id INTEGER,
+            size TEXT,
+            quantity INTEGER,
+            unit_price REAL,
+            FOREIGN KEY (order_id) REFERENCES ORDERS(order_id),
+            FOREIGN KEY (product_id) REFERENCES PRODUCTS(product_id)
+        );
+    ''')
+    conn.commit()
+
+    # 3. Add initial users (Idempotent: using SELECT to check existence)
+    # Check if the 'admin' user exists
+    c.execute("SELECT COUNT(*) FROM USERS WHERE username = 'admin'")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
+        c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
         conn.commit()
 
-        # 3. Add initial users (Idempotent: handles IntegrityError if already exists)
-        try:
-            c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
-            c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
-            conn.commit()
-        except sqlite3.IntegrityError: 
-            pass # Users already exist
-        except sqlite3.OperationalError:
-            # Crucial: If locked during insertion, rollback and let the next rerun try.
-            conn.rollback() 
-            raise # Re-raise to trigger the outer handler
-
-        # 4. Add initial product data if not present 
-        c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
-        product_data_exists = c.fetchone()
-        
-        if product_data_exists is None:
-            try:
-                c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
-                          (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
-                conn.commit()
-            except sqlite3.OperationalError:
-                conn.rollback()
-                raise
-
-        return conn
+    # 4. Add initial product data if not present (using SELECT to check existence)
+    c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
+    product_data_exists = c.fetchone()
     
-    except sqlite3.OperationalError as e:
-        # If a lock occurs during the setup phase, we clear the cache and trigger a rerun.
-        # This is the most reliable way to recover from locks in Streamlit's concurrency model.
-        st.error("Database initialization failed due to a temporary lock. Attempting to restart...")
-        st.cache_resource.clear()
-        st.rerun()
-        # Should not reach here, but return None as fallback
-        return None 
-    except Exception as e:
-        st.error(f"An unexpected error occurred during database setup: {e}")
-        st.cache_resource.clear()
-        st.rerun()
-        return None
+    if product_data_exists is None:
+        c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
+                  (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
+        conn.commit()
+
+    return conn
 
 # Helper function to get the cached connection
 def get_db_connection():
@@ -121,7 +99,6 @@ def verify_user(username, password):
     c.execute("SELECT password_hash FROM USERS WHERE username = ?", (username,))
     result = c.fetchone()
     if result:
-        # Note: hash_password is used here again to hash the input password for comparison
         return result[0] == hash_password(password)
     return False
 
@@ -181,7 +158,6 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
 
     except Exception as e:
         conn.rollback() # Use rollback on failure
-        # Handle general operational errors during live transaction
         if isinstance(e, sqlite3.OperationalError) and 'database is locked' in str(e):
              st.error("The database is currently busy. Please try completing your order again.")
              return False, "Database busy."
@@ -190,10 +166,9 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
              return False, f"Order failed due to an internal error. {e}"
 
 
-# --- Streamlit Page Functions (Unchanged) ---
+# --- Streamlit Page Functions ---
 
 def login_page():
-    # ... (login page logic)
     st.subheader("Login / Sign Up")
 
     col1, col2 = st.columns(2)
@@ -233,7 +208,6 @@ def login_page():
                     st.error("Username already exists or database is busy.")
 
 def product_page():
-    # ... (product page logic)
     st.title("T-Shirt Store")
 
     product = get_product_details(PRODUCT_ID)
@@ -265,7 +239,7 @@ def product_page():
     
     with col_qty:
         # Use existing quantity or default to 1
-        default_qty = existing_item['quantity'] if existing_item else 1
+        default_qty = existing_item['quantity'] if existing_item and existing_item['size'] == size else 1
         quantity = st.number_input("Quantity", min_value=1, max_value=product['stock'], value=default_qty, step=1)
     
     with col_add:
@@ -283,10 +257,25 @@ def product_page():
                 }
 
                 # Update cart: remove old entry for this product and size, then add new one
-                st.session_state['cart'] = [item for item in st.session_state['cart'] if not (item['product_id'] == PRODUCT_ID and item['size'] == size)]
-                st.session_state['cart'].append(new_item)
+                # Note: The logic below removes ALL items with the same product_id regardless of size. 
+                # A more correct cart would keep separate sizes. Let's fix that.
                 
-                st.toast(f"{quantity}x {size} {product['name']} added to cart!")
+                # Check if an item with the exact same size already exists
+                cart_updated = False
+                for i in range(len(st.session_state['cart'])):
+                    item = st.session_state['cart'][i]
+                    if item['product_id'] == PRODUCT_ID and item['size'] == size:
+                        # Update quantity of existing item
+                        st.session_state['cart'][i]['quantity'] = quantity
+                        st.session_state['cart'][i]['total'] = quantity * item['price']
+                        cart_updated = True
+                        break
+                
+                if not cart_updated:
+                    # If not found, append the new item
+                    st.session_state['cart'].append(new_item)
+
+                st.toast(f"{quantity}x {size} {product['name']} added/updated in cart!")
             else:
                 st.error("Invalid quantity.")
 
@@ -329,7 +318,7 @@ def checkout_page():
         submitted = st.form_submit_button("Complete Order")
 
         if submitted:
-            # Check for required fields (Streamlit's required=True does client-side checks, but good to double-check)
+            # Check for required fields
             if not all([full_name, address, city, zip_code]):
                 st.error("Please fill in all shipping fields.")
             else:
@@ -351,7 +340,6 @@ def checkout_page():
                     st.session_state['page'] = 'order_complete'
                     st.session_state['last_order_id'] = result
                     st.rerun()
-                # If failure, the place_order function handles the error message
 
 def order_complete_page():
     st.title("Order Confirmed!")
@@ -365,13 +353,10 @@ def order_complete_page():
         st.rerun()
 
 def dashboard_page():
-    # ... (dashboard page logic)
     st.title("User Dashboard")
     st.subheader(f"Welcome, {st.session_state['username'].capitalize()}")
 
     conn = get_db_connection()
-    # It's safer to use parameterized queries even for simple selects to avoid SQL injection risks, 
-    # even though Streamlit's environment is somewhat controlled.
     df_orders = pd.read_sql_query("SELECT order_id, order_date, total_amount, status FROM ORDERS WHERE username = ? ORDER BY order_date DESC", 
                                   conn, params=(st.session_state['username'],))
 
@@ -398,9 +383,12 @@ def main_app():
     """The main entry point for the Streamlit application."""
     
     # 1. Initialize DB Connection using the cached function
-    # This call runs the initialization only once globally and handles 
-    # OperationalError by clearing cache and rerunning.
-    get_db_connection_and_init() 
+    # This must run first. If it returns None (due to a critical error), the app must stop.
+    conn = get_db_connection_and_init() 
+    if conn is None:
+        # A serious error occurred, but the caching function should prevent this now.
+        # If we reach here, Streamlit has failed to render anything.
+        st.stop()
 
     # 2. Initialize session state variables
     if 'logged_in' not in st.session_state:
@@ -459,4 +447,8 @@ def main_app():
 
 # The execution point of the script
 if __name__ == '__main__':
-    main_app()
+    # Wrap main_app in a try/except for a clean display on unexpected errors
+    try:
+        main_app()
+    except Exception as e:
+        st.error(f"An unexpected error occurred during application runtime. Please refresh the page. Error: {e}")
