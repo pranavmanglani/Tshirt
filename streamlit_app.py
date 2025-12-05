@@ -31,7 +31,6 @@ def init_db():
     # Define all necessary tables (DDL)
     # DDL is executed outside the DML transaction block
     c.executescript('''
-        -- UPDATED: Added EMAIL column for sign-up
         CREATE TABLE IF NOT EXISTS USERS (
             username TEXT PRIMARY KEY,
             email TEXT NOT NULL UNIQUE, 
@@ -39,10 +38,12 @@ def init_db():
             role TEXT NOT NULL
         );
 
+        -- UPDATED: Added price_usd for revenue calculation
         CREATE TABLE IF NOT EXISTS DESIGNS (
             design_id INTEGER PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
-            description TEXT
+            description TEXT,
+            price_usd REAL NOT NULL DEFAULT 19.99
         );
 
         CREATE TABLE IF NOT EXISTS PRODUCTION_LOG (
@@ -67,11 +68,11 @@ def init_db():
                 c.execute("INSERT INTO USERS (username, email, password_hash, role) VALUES (?, ?, ?, ?)",
                           ('customer1', 'cust1@email.com', hash_password('customerpass'), 'customer'))
 
-            # Add initial designs
+            # Add initial designs (with price_usd)
             if not c.execute("SELECT 1 FROM DESIGNS").fetchone():
-                c.execute("INSERT INTO DESIGNS (name, description) VALUES (?, ?)", ('Logo Tee', 'Standard company logo print'))
-                c.execute("INSERT INTO DESIGNS (name, description) VALUES (?, ?)", ('Abstract Art', 'Limited edition vibrant print'))
-                c.execute("INSERT INTO DESIGNS (name, description) VALUES (?, ?)", ('Vintage Stripes', 'Classic striped design'))
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Logo Tee', 'Standard company logo print', 24.99))
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Abstract Art', 'Limited edition vibrant print', 35.50))
+                c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", ('Vintage Stripes', 'Classic striped design', 19.99))
 
             # Add mock production logs for chart demonstration
             if not c.execute("SELECT 1 FROM PRODUCTION_LOG").fetchone():
@@ -200,10 +201,21 @@ def signup_page():
 
 
 def get_production_data(conn):
-    """Fetches all production log data for charting."""
+    """Fetches production log data along with current product price for revenue calculation."""
     try:
-        # Fetch all data from the PRODUCTION_LOG table
-        df = pd.read_sql_query("SELECT * FROM PRODUCTION_LOG ORDER BY log_date", conn)
+        # Fetch all data from the PRODUCTION_LOG table, joining with DESIGNS to get current price
+        # Note: This calculates "Potential Revenue" based on current price, not "Actual Sales Revenue"
+        query = """
+        SELECT 
+            p.*, 
+            d.price_usd 
+        FROM PRODUCTION_LOG p
+        JOIN DESIGNS d ON p.product_name = d.name
+        ORDER BY p.log_date
+        """
+        df = pd.read_sql_query(query, conn)
+        # Calculate potential revenue for each log entry
+        df['potential_revenue'] = df['units_produced'] * df['price_usd']
         df['log_date'] = pd.to_datetime(df['log_date'])
         return df
     except pd.io.sql.DatabaseError:
@@ -212,26 +224,64 @@ def get_production_data(conn):
         return pd.DataFrame()
 
 
-def performance_tracking_page():
-    """Displays improved production performance graphs."""
+def performance_and_sales_page():
+    """Displays improved production performance graphs and revenue metrics."""
     conn = get_db_connection()
-    st.title("📈 Production Performance Tracking")
+    st.title("📈 Performance and Sales Tracking")
 
     df = get_production_data(conn)
     if df.empty:
         st.info("No production data available yet. Please log some production runs to see the graphs.")
         return
+        
+    # --- 1. Top Level Metrics (Revenue and Volume) ---
+    total_revenue = df['potential_revenue'].sum()
+    total_units_produced = df['units_produced'].sum()
+    total_defects = df['defects'].sum()
+    defect_rate_overall = (total_defects / total_units_produced) * 100 if total_units_produced else 0
+    
+    st.subheader("Financial and Volume Overview")
+    col_rev, col_units, col_def_rate = st.columns(3)
+    
+    with col_rev:
+        st.metric(label="Total Potential Revenue", value=f"${total_revenue:,.2f}")
+        
+    with col_units:
+        st.metric(label="Total Units Produced", value=f"{total_units_produced:,}")
+        
+    with col_def_rate:
+        st.metric(label="Overall Defect Rate", value=f"{defect_rate_overall:.2f}%")
+        
+    st.markdown("---")
 
-    # 1. Prepare Daily Aggregation Data
+    # 2. Prepare Daily Aggregation Data
     df_daily = df.groupby('log_date').agg(
         total_units=('units_produced', 'sum'),
-        total_defects=('defects', 'sum')
+        total_defects=('defects', 'sum'),
+        total_revenue=('potential_revenue', 'sum') # ADDED REVENUE AGGREGATION
     ).reset_index()
     
     # Calculate defect rate for the trend chart
     df_daily['defect_rate'] = (df_daily['total_defects'] / df_daily['total_units']) * 100
-    # Handle division by zero for days with no production
     df_daily.loc[df_daily['total_units'] == 0, 'defect_rate'] = 0 
+    
+    # --- Chart 1: Daily Revenue Trend (Bar Chart) ---
+    st.subheader("Daily Potential Revenue")
+    
+    revenue_chart = alt.Chart(df_daily).mark_bar().encode(
+        x=alt.X('log_date:T', axis=alt.Axis(title='Date', format='%Y-%m-%d')),
+        y=alt.Y('total_revenue:Q', title='Potential Revenue (USD)'),
+        tooltip=[
+            alt.Tooltip('log_date:T', title='Date'),
+            alt.Tooltip('total_revenue:Q', title='Revenue', format='$,.2f'),
+            alt.Tooltip('total_units:Q', title='Units Produced', format=',.0f'),
+        ]
+    ).properties(
+        title='Daily Revenue from Production Volume'
+    )
+    st.altair_chart(revenue_chart, use_container_width=True)
+
+    st.markdown("---")
     
     # Melt data for the layered chart (Production vs Defects)
     df_melted = df_daily.melt(id_vars=['log_date'], 
@@ -239,8 +289,9 @@ def performance_tracking_page():
                              var_name='Metric', 
                              value_name='Count')
 
-    # --- Chart 1: Daily Production and Defects (Layered Column Chart) ---
-    st.subheader("Daily Production Volume and Defects")
+    # --- Chart 2: Daily Production and Defects (Layered Column Chart) ---
+    # UPDATED SUBHEADER AND TITLE FOR CLARITY
+    st.subheader("Daily Production Volume vs. Daily Defects (Quality Control)")
     
     # Base chart setup
     base = alt.Chart(df_melted).encode(
@@ -260,22 +311,15 @@ def performance_tracking_page():
     ).resolve_scale(
         y='independent' # Key: Ensures 'Units Produced' and 'Defects' have separate Y-axes
     ).properties(
-        title='Daily Units Produced vs. Defects Recorded'
+        title='Comparison of Daily Units Produced and Defects Recorded' # Updated Title
     )
 
     st.altair_chart(bars, use_container_width=True)
     
     st.markdown("---")
 
-    # --- Chart 2: Defect Rate Trend (%) (Line Chart) ---
+    # --- Chart 3: Defect Rate Trend (%) (Line Chart) ---
     st.subheader("Defect Rate Trend (%)")
-    
-    # Find the latest defect rate
-    latest_rate = df_daily['defect_rate'].iloc[-1]
-    
-    col_rate, col_gap = st.columns([1, 4])
-    with col_rate:
-        st.metric(label="Latest Defect Rate", value=f"{latest_rate:.2f}%")
 
     rate_chart = alt.Chart(df_daily).mark_line(point=True, strokeWidth=3, color='#F06E6E').encode(
         x=alt.X('log_date:T', title='Date'),
@@ -300,7 +344,7 @@ def dashboard_page():
     if st.session_state['role'] == 'admin':
         st.header("Admin Overview")
         st.info("Use the sidebar navigation to manage products, log production, or view performance.")
-        performance_tracking_page() # Admins see the performance tracking by default
+        performance_and_sales_page() # Admins see the performance tracking by default
         
     elif st.session_state['role'] == 'customer':
         st.header("Customer Portal")
@@ -353,15 +397,19 @@ def manage_designs_page():
         return
 
     conn = get_db_connection()
-    st.title("Design Management")
-
+    st.title("Product (Design) Management") # Updated title
+    
     col1, col2 = st.columns([1, 2])
 
     with col1:
-        st.subheader("Add New Design")
+        st.subheader("Add New Product Design") # Updated subheader
         with st.form("add_design_form"):
             name = st.text_input("Design Name (Unique)")
-            description = st.text_area("Description")
+            description = st.text_area("Description (e.g., color, material)")
+            
+            # ADDED: Price input for revenue calculation
+            price_usd = st.number_input("Unit Price (USD)", min_value=0.01, step=0.01, format="%.2f", value=19.99)
+            
             submitted = st.form_submit_button("Add Design")
 
             if submitted:
@@ -369,7 +417,8 @@ def manage_designs_page():
                     try:
                         with conn:
                             c = conn.cursor()
-                            c.execute("INSERT INTO DESIGNS (name, description) VALUES (?, ?)", (name, description))
+                            # Updated insertion query to include price_usd
+                            c.execute("INSERT INTO DESIGNS (name, description, price_usd) VALUES (?, ?, ?)", (name, description, price_usd))
                             # conn.commit() is implicitly called by 'with conn:'
                         st.success(f"Design '{name}' added successfully!")
                     except sqlite3.IntegrityError:
@@ -387,7 +436,8 @@ def view_designs_page():
     conn = get_db_connection()
     st.subheader("Current T-Shirt Designs")
     
-    df_designs = pd.read_sql_query("SELECT name, description FROM DESIGNS ORDER BY name", conn)
+    # UPDATED: Select price_usd for display
+    df_designs = pd.read_sql_query("SELECT name, description, price_usd FROM DESIGNS ORDER BY name", conn)
 
     if df_designs.empty:
         st.info("No designs have been added yet.")
@@ -396,7 +446,9 @@ def view_designs_page():
             df_designs,
             column_config={
                 "name": st.column_config.TextColumn("Design Name", help="The unique name of the T-Shirt design"),
-                "description": st.column_config.TextColumn("Description", help="Details about the design and print style")
+                "description": st.column_config.TextColumn("Description", help="Details about the design and print style"),
+                # ADDED: column config for price
+                "price_usd": st.column_config.NumberColumn("Unit Price", help="Selling price per unit", format="%.2f", default=19.99)
             },
             hide_index=True,
             use_container_width=True
@@ -441,7 +493,8 @@ def main_app():
                     st.session_state['page'] = 'dashboard'
                 if st.button("Log Production", key="nav_prod"):
                     st.session_state['page'] = 'manage_production'
-                if st.button("Performance Tracking", key="nav_perf"):
+                # UPDATED: Changed page name to reflect new feature
+                if st.button("Performance & Sales", key="nav_perf"):
                     st.session_state['page'] = 'performance_tracking'
                 if st.button("Manage Designs", key="nav_design"):
                     st.session_state['page'] = 'manage_designs'
@@ -462,12 +515,13 @@ def main_app():
     # --- Page Router ---
     if st.session_state['page'] == 'login' or not st.session_state['authenticated']:
         login_page()
+    # UPDATED: Page mapping
     elif st.session_state['page'] == 'dashboard':
         dashboard_page()
     elif st.session_state['page'] == 'manage_production':
         manage_production_page()
     elif st.session_state['page'] == 'performance_tracking':
-        performance_tracking_page()
+        performance_and_sales_page() # Using the updated function
     elif st.session_state['page'] == 'manage_designs':
         manage_designs_page()
     elif st.session_state['page'] == 'view_designs':
