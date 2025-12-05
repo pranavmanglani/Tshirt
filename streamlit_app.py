@@ -14,88 +14,106 @@ PRODUCT_ID = 1  # Fixed ID for the single T-shirt product
 
 # --- Database Initialization and Connection ---
 
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
 # FIX: Use @st.cache_resource to ensure the database connection and
 # initialization happen only once, preventing 'database is locked' errors.
-@st.cache_resource
+# We explicitly handle OperationalError inside this function for robustness.
+@st.cache_resource(show_spinner=False) # Hiding spinner as this runs on every load
 def get_db_connection_and_init():
     """Initializes the database, creates tables, populates initial data,
     and returns a thread-safe connection object."""
     
-    # 1. Establish Connection (set check_same_thread=False for Streamlit environment)
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-    c = conn.cursor()
-
-    # 2. Define all necessary tables
-    c.executescript('''
-        CREATE TABLE IF NOT EXISTS USERS (
-            username TEXT PRIMARY KEY,
-            password_hash TEXT,
-            role TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS PRODUCTS (
-            product_id INTEGER PRIMARY KEY,
-            name TEXT,
-            description TEXT,
-            price REAL,
-            stock INTEGER
-        );
-
-        CREATE TABLE IF NOT EXISTS ORDERS (
-            order_id TEXT PRIMARY KEY,
-            username TEXT,
-            order_date TEXT,
-            total_amount REAL,
-            status TEXT,
-            FOREIGN KEY (username) REFERENCES USERS(username)
-        );
-
-        CREATE TABLE IF NOT EXISTS ORDER_ITEMS (
-            item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            order_id TEXT,
-            product_id INTEGER,
-            size TEXT,
-            quantity INTEGER,
-            unit_price REAL,
-            FOREIGN KEY (order_id) REFERENCES ORDERS(order_id),
-            FOREIGN KEY (product_id) REFERENCES PRODUCTS(product_id)
-        );
-    ''')
-    conn.commit()
-
-    # 3. Add initial users (Idempotent: handles IntegrityError if already exists)
     try:
-        c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
-        c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
-        conn.commit()
-    except sqlite3.IntegrityError: 
-        pass # Users already exist
+        # 1. Establish Connection (set check_same_thread=False for Streamlit environment)
+        conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+        c = conn.cursor()
 
-    # 4. Add initial product data if not present (using a helper function below)
-    # We must commit the users first to prevent the operational error in case 
-    # the insertion point was the issue.
-    
-    # Check for product existence using the same connection
-    c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
-    product_data_exists = c.fetchone()
-    
-    if product_data_exists is None:
+        # 2. Define all necessary tables (This part is fast and safe)
+        c.executescript('''
+            CREATE TABLE IF NOT EXISTS USERS (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT,
+                role TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS PRODUCTS (
+                product_id INTEGER PRIMARY KEY,
+                name TEXT,
+                description TEXT,
+                price REAL,
+                stock INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS ORDERS (
+                order_id TEXT PRIMARY KEY,
+                username TEXT,
+                order_date TEXT,
+                total_amount REAL,
+                status TEXT,
+                FOREIGN KEY (username) REFERENCES USERS(username)
+            );
+
+            CREATE TABLE IF NOT EXISTS ORDER_ITEMS (
+                item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT,
+                product_id INTEGER,
+                size TEXT,
+                quantity INTEGER,
+                unit_price REAL,
+                FOREIGN KEY (order_id) REFERENCES ORDERS(order_id),
+                FOREIGN KEY (product_id) REFERENCES PRODUCTS(product_id)
+            );
+        ''')
+        conn.commit()
+
+        # 3. Add initial users (Idempotent: handles IntegrityError if already exists)
         try:
-            c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
-                      (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
+            c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('admin'), 'admin'))
+            c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('customer1'), 'customer'))
             conn.commit()
         except sqlite3.IntegrityError: 
-            pass # Product already exists
+            pass # Users already exist
+        except sqlite3.OperationalError:
+            # Crucial: If locked during insertion, rollback and let the next rerun try.
+            conn.rollback() 
+            raise # Re-raise to trigger the outer handler
 
-    return conn
+        # 4. Add initial product data if not present 
+        c.execute("SELECT product_id FROM PRODUCTS WHERE product_id = ?", (PRODUCT_ID,))
+        product_data_exists = c.fetchone()
+        
+        if product_data_exists is None:
+            try:
+                c.execute("INSERT INTO PRODUCTS VALUES (?, ?, ?, ?, ?)",
+                          (PRODUCT_ID, 'Vintage Coding Tee', 'A comfortable cotton t-shirt for developers.', 25.00, 100))
+                conn.commit()
+            except sqlite3.OperationalError:
+                conn.rollback()
+                raise
+
+        return conn
+    
+    except sqlite3.OperationalError as e:
+        # If a lock occurs during the setup phase, we clear the cache and trigger a rerun.
+        # This is the most reliable way to recover from locks in Streamlit's concurrency model.
+        st.error("Database initialization failed due to a temporary lock. Attempting to restart...")
+        st.cache_resource.clear()
+        st.rerun()
+        # Should not reach here, but return None as fallback
+        return None 
+    except Exception as e:
+        st.error(f"An unexpected error occurred during database setup: {e}")
+        st.cache_resource.clear()
+        st.rerun()
+        return None
 
 # Helper function to get the cached connection
 def get_db_connection():
     """Returns the cached database connection object."""
     return get_db_connection_and_init()
 
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
 
 def verify_user(username, password):
     conn = get_db_connection()
@@ -116,6 +134,11 @@ def add_user(username, password):
         return True
     except sqlite3.IntegrityError:
         return False
+    except sqlite3.OperationalError:
+        # Handle lock if it occurs during sign up
+        conn.rollback()
+        st.warning("Database busy. Please try again.")
+        return False
 
 def get_product_details(product_id):
     conn = get_db_connection()
@@ -133,9 +156,6 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
     order_date = datetime.datetime.now().isoformat()
 
     try:
-        # Start transaction
-        # conn.execute('BEGIN TRANSACTION') # No need for explicit begin transaction here, managed by commit/rollback
-
         # 1. Insert into ORDERS table
         c.execute("INSERT INTO ORDERS (order_id, username, order_date, total_amount, status) VALUES (?, ?, ?, ?, ?)",
                   (order_id, username, order_date, total_amount, 'Processing'))
@@ -161,14 +181,19 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
 
     except Exception as e:
         conn.rollback() # Use rollback on failure
-        st.error(f"Database error during order placement: {e}")
-        return False, f"Order failed due to an internal error. {e}"
+        # Handle general operational errors during live transaction
+        if isinstance(e, sqlite3.OperationalError) and 'database is locked' in str(e):
+             st.error("The database is currently busy. Please try completing your order again.")
+             return False, "Database busy."
+        else:
+             st.error(f"Database error during order placement: {e}")
+             return False, f"Order failed due to an internal error. {e}"
 
 
-# --- Streamlit Page Functions ---
+# --- Streamlit Page Functions (Unchanged) ---
 
 def login_page():
-    # ... (login page logic, assumed correct)
+    # ... (login page logic)
     st.subheader("Login / Sign Up")
 
     col1, col2 = st.columns(2)
@@ -200,12 +225,15 @@ def login_page():
                 if len(signup_username) < 3 or len(signup_password) < 5:
                     st.error("Username must be at least 3 characters and password at least 5.")
                 elif add_user(signup_username, signup_password):
-                    st.success("Account created! You can now log in.")
+                    st.session_state['logged_in'] = True
+                    st.session_state['username'] = signup_username
+                    st.success("Account created! You are now logged in.")
+                    st.rerun()
                 else:
-                    st.error("Username already exists.")
+                    st.error("Username already exists or database is busy.")
 
 def product_page():
-    # ... (product page logic, assumed correct)
+    # ... (product page logic)
     st.title("T-Shirt Store")
 
     product = get_product_details(PRODUCT_ID)
@@ -284,12 +312,8 @@ def checkout_page():
     
     st.subheader("Shipping Information")
 
-    # FIX: Use st.form and st.form_submit_button() here to submit the checkout details.
-    # This addresses the 'Missing Submit Button' error.
     with st.form("checkout_form"):
         # Pre-fill name from session state if available
-        # The .capitalize() should be safe if 'username' is in session_state,
-        # but we'll use a try/except or default value for robustness.
         default_name = st.session_state.get('username', '').capitalize() or ""
 
         full_name = st.text_input("Full Name", value=default_name, required=True, key="checkout_full_name")
@@ -327,9 +351,7 @@ def checkout_page():
                     st.session_state['page'] = 'order_complete'
                     st.session_state['last_order_id'] = result
                     st.rerun()
-                else:
-                    st.error(f"Failed to place order: {result}")
-
+                # If failure, the place_order function handles the error message
 
 def order_complete_page():
     st.title("Order Confirmed!")
@@ -343,12 +365,15 @@ def order_complete_page():
         st.rerun()
 
 def dashboard_page():
-    # ... (dashboard page logic, assumed correct)
+    # ... (dashboard page logic)
     st.title("User Dashboard")
     st.subheader(f"Welcome, {st.session_state['username'].capitalize()}")
 
     conn = get_db_connection()
-    df_orders = pd.read_sql_query(f"SELECT order_id, order_date, total_amount, status FROM ORDERS WHERE username = '{st.session_state['username']}' ORDER BY order_date DESC", conn)
+    # It's safer to use parameterized queries even for simple selects to avoid SQL injection risks, 
+    # even though Streamlit's environment is somewhat controlled.
+    df_orders = pd.read_sql_query("SELECT order_id, order_date, total_amount, status FROM ORDERS WHERE username = ? ORDER BY order_date DESC", 
+                                  conn, params=(st.session_state['username'],))
 
     if df_orders.empty:
         st.info("You have no past orders.")
@@ -373,7 +398,8 @@ def main_app():
     """The main entry point for the Streamlit application."""
     
     # 1. Initialize DB Connection using the cached function
-    # This call runs the initialization only once globally.
+    # This call runs the initialization only once globally and handles 
+    # OperationalError by clearing cache and rerunning.
     get_db_connection_and_init() 
 
     # 2. Initialize session state variables
