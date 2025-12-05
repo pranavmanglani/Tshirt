@@ -215,7 +215,8 @@ class DBManager:
                 raise e
 
 # --- Global Database Manager Instance (Protected Cache) ---
-@st.cache_resource(suppress_st_warning=True)
+# FIX: Removed the invalid 'suppress_st_warning=True' argument
+@st.cache_resource
 def get_db_manager():
     # FORCE DATABASE RECREATION to ensure sample data is always present
     if os.path.exists(DB_NAME):
