@@ -3,6 +3,7 @@ import sqlite3
 import pandas as pd
 import hashlib
 import random
+import time # Added for safe retry logic
 
 # --- CONFIGURATION & UTILITIES ---
 
@@ -48,7 +49,7 @@ def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 def init_db():
-    """Initializes database tables and populates initial data."""
+    """Initializes database tables and safely populates initial data."""
     conn = get_db_connection()
     c = conn.cursor()
 
@@ -85,29 +86,52 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES USERS(username)
         );
     ''')
+    conn.commit() # Commit table creation immediately
 
-    # Add initial users
-    try:
-        c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('adminpass'), 'admin'))
-        c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('custpass'), 'customer'))
-        conn.commit()
-    except sqlite3.IntegrityError: pass
-
-    # Add initial products
-    initial_products = [
-        ("Classic Navy Tee", 24.99, "M", "https://placehold.co/150x150/1C3144/FFFFFF?text=Navy+Tee"),
-        ("Summer V-Neck", 19.50, "S", "https://placehold.co/150x150/FFCC00/000000?text=Yellow+V-Neck"),
-        ("Oversized Black Hoodie", 49.99, "L", "https://placehold.co/150x150/000000/FFFFFF?text=Black+Hoodie"),
-        ("Striped Casual Shirt", 35.00, "XL", "https://placehold.co/150x150/93A3BC/FFFFFF?text=Striped+Shirt"),
-    ]
-    for name, price, size, url in initial_products:
+    # --- SAFE INITIAL DATA INSERTION ---
+    # This block handles the OperationalError (database is locked) during Streamlit restarts
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            # Check if product exists before inserting
-            c.execute("SELECT id FROM PRODUCTS WHERE name = ? AND size = ?", (name, size))
-            if c.fetchone() is None:
-                c.execute("INSERT INTO PRODUCTS (name, price, size, image_url) VALUES (?, ?, ?, ?)", (name, price, size, url))
+            # 1. Add initial users
+            try:
+                c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('admin', hash_password('adminpass'), 'admin'))
+                c.execute("INSERT INTO USERS VALUES (?, ?, ?)", ('customer1', hash_password('custpass'), 'customer'))
                 conn.commit()
-        except sqlite3.IntegrityError: pass
+            except sqlite3.IntegrityError: 
+                pass # User already exists, safe to ignore
+
+            # 2. Add initial products
+            initial_products = [
+                ("Classic Navy Tee", 24.99, "M", "https://placehold.co/150x150/1C3144/FFFFFF?text=Navy+Tee"),
+                ("Summer V-Neck", 19.50, "S", "https://placehold.co/150x150/FFCC00/000000?text=Yellow+V-Neck"),
+                ("Oversized Black Hoodie", 49.99, "L", "https://placehold.co/150x150/000000/FFFFFF?text=Black+Hoodie"),
+                ("Striped Casual Shirt", 35.00, "XL", "https://placehold.co/150x150/93A3BC/FFFFFF?text=Striped+Shirt"),
+            ]
+            for name, price, size, url in initial_products:
+                try:
+                    c.execute("SELECT id FROM PRODUCTS WHERE name = ? AND size = ?", (name, size))
+                    if c.fetchone() is None:
+                        c.execute("INSERT INTO PRODUCTS (name, price, size, image_url) VALUES (?, ?, ?, ?)", (name, price, size, url))
+                        conn.commit()
+                except sqlite3.IntegrityError: 
+                    pass # Product already exists, safe to ignore
+            
+            # If we reach here, the insertion succeeded without a lock error. Break out of the retry loop.
+            break
+
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e):
+                if attempt < max_retries - 1:
+                    # Wait and retry if locked
+                    time.sleep(0.5)
+                else:
+                    # If max retries reached, raise the error
+                    st.error(f"Failed to initialize database after {max_retries} attempts: Database is locked.")
+                    raise
+            else:
+                # Re-raise any other unexpected operational error
+                raise
 
 # --- AUTHENTICATION & SESSION ---
 
@@ -177,6 +201,7 @@ def auth_forms():
                     result = sign_up_user(new_username, new_password)
                     if result == "Success": st.success("Account created successfully! Please log in.")
                     else: st.error(result)
+
 # --- ADMIN FEATURES (CRUD) ---
 
 def admin_add_product():
@@ -564,8 +589,9 @@ def user_profile_view():
                 "order_date": "Date Placed",
             },
             hide_index=True
-                    )
-                    def customer_faq_enquiries():
+        )
+
+def customer_faq_enquiries():
     """Section for FAQs and enquiries."""
     st.markdown("### ❓ Customer Enquiries & FAQ")
     st.markdown("""
