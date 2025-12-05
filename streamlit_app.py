@@ -6,7 +6,6 @@ import datetime
 import pandas as pd
 from threading import Lock
 import os
-import time
 
 # Set page configuration for a better look
 st.set_page_config(page_title="Code & Thread Shop", layout="centered", initial_sidebar_state="expanded")
@@ -19,21 +18,20 @@ PRODUCT_ID = 1  # Fixed ID for the single T-shirt product
 class DBManager:
     """
     Manages the SQLite connection and enforces thread safety using a Lock.
+    Crucially, it assumes the DB file is ALREADY fully created and initialized.
     """
     def __init__(self, db_path):
         self.db_path = db_path
         # Lock for thread safety within a single process
         self._lock = Lock() 
-        # Establish connection first
+        # Establish connection. This MUST happen AFTER initialization is guaranteed.
         self._conn = self._get_connection() 
-        # The database is assumed to be fully initialized at this point by get_db_manager
 
     def _get_connection(self):
-        """Creates the connection with a high timeout."""
-        # Set connection timeout to 60 seconds 
+        """Creates the connection with a high timeout and WAL mode."""
+        # Set connection timeout to 60 seconds (generous for a locked situation)
         conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=60)
         # Enable write-ahead logging (WAL) for better concurrency performance
-        # WAL allows multiple readers while one writer is active.
         conn.execute("PRAGMA journal_mode=WAL") 
         conn.row_factory = sqlite3.Row # Allows column access by name
         return conn
@@ -44,7 +42,7 @@ class DBManager:
         """
         Creates the database in a temporary location, initializes tables, 
         and then moves it to the final location (target_db_path).
-        This guarantees atomicity for the schema creation.
+        This guarantees atomicity for the schema creation across processes.
         """
         # 1. Use a temporary, unique file name for creation
         db_temp_name = f'tshirt_shop_temp_{uuid.uuid4()}.db'
@@ -56,7 +54,7 @@ class DBManager:
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
             
-            # Use a context manager to ensure transaction integrity (atomic commit/rollback)
+            # Use a context manager for explicit transaction (atomic commit/rollback)
             with conn: 
                 # Define all necessary tables using a single executescript for atomic schema setup
                 schema_script = f'''
@@ -121,8 +119,7 @@ class DBManager:
                     try:
                         os.remove(p)
                     except OSError:
-                        # If removal fails, the file is locked, which is fine, 
-                        # the rename operation will still try to overwrite it (or fail cleanly)
+                        # File is locked, which is fine, we just skip it.
                         pass
                         
             # The rename is the atomic operation that completes the initialization
@@ -132,47 +129,86 @@ class DBManager:
             # Clean up the temporary file if an error occurred before the swap
             if os.path.exists(db_temp_name):
                 os.remove(db_temp_name)
-            raise e
+            raise Exception(f"CRITICAL DB INIT ERROR: {e}")
         finally:
             if conn:
                 conn.close()
-            # Final cleanup of the temp file just in case the rename failed partially
+            # Final cleanup of the temp file just in case
             if os.path.exists(db_temp_name):
                 os.remove(db_temp_name)
 
+
+    def execute_query(self, query, params=(), commit=False):
+        """Executes a non-SELECT query with thread lock protection."""
+        with self._lock:
+            conn = self._conn
+            c = conn.cursor()
+            try:
+                if commit:
+                    with conn:
+                        c.execute(query, params)
+                else:
+                    c.execute(query, params)
+                return c
+            except sqlite3.OperationalError as e:
+                # This catches the 'database is locked' error if it somehow persists
+                raise e
+            except Exception as e:
+                raise e
+
+    def fetch_query(self, query, params=()):
+        """Executes a SELECT query and fetches results with thread lock protection."""
+        with self._lock:
+            conn = self._conn
+            c = conn.cursor()
+            try:
+                c.execute(query, params)
+                return c.fetchall()
+            except Exception as e:
+                raise e
+
+    def fetch_query_df(self, query, params=()):
+        """Executes a SELECT query and fetches results as a Pandas DataFrame."""
+        with self._lock:
+            conn = self._conn
+            try:
+                df = pd.read_sql_query(query, conn, params=params)
+                return df
+            except Exception as e:
+                raise e
 
 # --- Global Database Manager Instance ---
 @st.cache_resource
 def get_db_manager():
     """
     Initializes and returns the thread-safe DBManager instance.
-    This function handles the critical, expensive initialization only once.
+    The initialization logic is separated from the DBManager class 
+    to prevent race conditions during schema creation.
     """
     if not os.path.exists(DB_NAME):
-        # This is the critical block that must be protected.
-        # Since st.cache_resource runs twice, the atomic swap method 
-        # is the most reliable way to prevent race conditions during schema creation.
+        # Only perform the expensive, critical initialization/swap if the file doesn't exist
         try:
+            # This static method handles the atomic creation and file swap.
             DBManager._initialize_db_atomically(DB_NAME)
         except Exception as e:
-            st.error(f"CRITICAL: Atomic database initialization failed. Error: {e}")
+            st.error(f"FATAL: Database initialization failed. Error: {e}")
+            # Re-raise to halt Streamlit if initialization fails.
             raise e
 
+    # Now that the file is guaranteed to exist and be complete, safely return the Manager.
     try:
-        # Now, the DB_NAME file is guaranteed to exist and have a complete schema.
-        # Initialize and return the thread-safe DBManager instance using the final file.
         return DBManager(DB_NAME)
     except Exception as e:
-        # If connection still fails, log the error and propagate
-        st.error(f"Failed to connect to the initialized database. Error: {e}")
+        st.error(f"Failed to connect to the finalized database. Error: {e}")
         raise e
 
 # --- Global Access to DB Manager ---
-# Attempt to get the DB manager instance and handle fatal errors.
 try:
+    # Attempt to get the DB manager instance
     db_manager = get_db_manager()
 except Exception as e:
-    st.error("CRITICAL: Application halted due to database failure. Please refresh and try again. A robust initialization was attempted.")
+    # If the exception propagated, stop the app execution
+    st.error("CRITICAL: Application halted due to persistent database failure. Please refresh and try again.")
     st.stop() 
 
 # --- Helper Functions Adapted to DBManager ---
@@ -187,7 +223,6 @@ def verify_user(username, password):
             return users[0]['password_hash'] == hash_password(password)
         return False
     except Exception:
-        # Fail silently on DB error during login attempt
         return False
 
 def add_user(username, password):
@@ -197,7 +232,7 @@ def add_user(username, password):
                                  commit=True)
         return True
     except sqlite3.IntegrityError:
-        return False # Username exists
+        return False 
     except sqlite3.OperationalError:
         st.warning("Database busy. Please try again.")
         return False
@@ -206,13 +241,12 @@ def add_user(username, password):
 
 def get_product_details(product_id):
     try:
+        # This function caused the failure, but should be safe now.
         products = db_manager.fetch_query("SELECT * FROM PRODUCTS WHERE product_id = ?", (product_id,))
         if products:
             row = products[0]
-            # Access columns by name, which is enabled by row_factory = sqlite3.Row
             return {'product_id': row['product_id'], 'name': row['name'], 'description': row['description'], 'price': row['price'], 'stock': row['stock']}
     except Exception as e:
-        # Log error for diagnosis but return None
         print(f"Error fetching product details: {e}")
         return None
     return None
@@ -222,35 +256,27 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
     order_date = datetime.datetime.now().isoformat()
 
     try:
-        # Acquire Lock and perform transaction
         with db_manager._lock:
             conn = db_manager._conn
             c = conn.cursor()
             
-            # Use conn context manager for automatic transaction control
             with conn: 
-                # 1. Insert into ORDERS table 
                 c.execute("INSERT INTO ORDERS (order_id, username, order_date, total_amount, status, full_name, address, city, zip_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (order_id, username, order_date, total_amount, 'Processing', full_name, address, city, zip_code))
 
-                # 2. Insert into ORDER_ITEMS and update stock
                 for item in cart_items:
                     c.execute("SELECT stock FROM PRODUCTS WHERE product_id = ?", (item['product_id'],))
                     product_stock = c.fetchone()
                     
                     if product_stock and product_stock[0] >= item['quantity']:
-                        # Insert item
                         c.execute("INSERT INTO ORDER_ITEMS (order_id, product_id, size, quantity, unit_price) VALUES (?, ?, ?, ?, ?)",
                                 (order_id, item['product_id'], item['size'], item['quantity'], item['price']))
 
-                        # Update stock
                         new_stock = product_stock[0] - item['quantity']
                         c.execute("UPDATE PRODUCTS SET stock = ? WHERE product_id = ?", (new_stock, item['product_id']))
                     else:
-                        # Rollback is handled by 'with conn:' if an exception is raised
                         raise Exception(f"Insufficient stock for product ID {item['product_id']}")
 
-            # Transaction committed automatically if the 'with conn:' block completes
             return True, order_id
 
     except sqlite3.OperationalError:
@@ -262,7 +288,7 @@ def place_order(username, cart_items, total_amount, full_name, address, city, zi
          return False, f"Order failed due to an internal error: {e}"
 
 
-# --- Streamlit Page Functions (No changes needed here) ---
+# --- Streamlit Page Functions ---
 
 def login_page():
     st.subheader("Login / Sign Up")
