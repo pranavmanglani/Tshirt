@@ -109,7 +109,7 @@ def dashboard_page():
 def shop_page():
     st.title("The Shop")
     
-    # Filter Option
+    # --- NEW: Filter Option ---
     categories = ["All"] + [r['category'] for r in db.query("SELECT DISTINCT category FROM PRODUCTS")]
     selected_cat = st.selectbox("Filter by Category", categories)
     
@@ -145,7 +145,7 @@ def product_detail_page():
         st.write(p['description'])
         st.subheader(f"${p['price']}")
         
-        # Product Details Input
+        # --- NEW: Product Details (Size & Qty) ---
         size = st.selectbox("Select Size", ["S", "M", "L", "XL", "XXL"])
         qty = st.number_input("Quantity", min_value=1, max_value=p['stock'], value=1)
         
@@ -158,7 +158,7 @@ def product_detail_page():
                 'qty': qty,
                 'total': p['price'] * qty
             })
-            st.success(f"Added {qty} {p['name']} (Size: {size}) to cart!")
+            st.success(f"Added {qty} {p['name']} to cart!")
 
 def checkout_page():
     st.title("Checkout")
@@ -176,28 +176,31 @@ def checkout_page():
         st.session_state['cart'] = []
         st.success("Order Complete!")
 
+# --- NEW: Sign Up Page ---
 def signup_page():
     st.title("Create Account")
-    new_email = st.text_input("Email (as Username)")
-    new_user = st.text_input("Full Name")
-    new_pw = st.text_input("Password", type="password")
-    confirm_pw = st.text_input("Confirm Password", type="password")
-    
-    if st.button("Register"):
-        if new_pw != confirm_pw:
-            st.error("Passwords do not match")
-        elif not new_email or not new_pw:
-            st.error("Please fill all fields")
-        else:
-            existing = db.query("SELECT * FROM USERS WHERE email=?", (new_email,))
-            if existing:
-                st.error("User already exists")
+    with st.form("signup_form"):
+        new_email = st.text_input("Email")
+        new_user = st.text_input("Username")
+        new_pw = st.text_input("Password", type="password")
+        confirm_pw = st.text_input("Confirm Password", type="password")
+        submit = st.form_submit_button("Sign Up")
+        
+        if submit:
+            if new_pw != confirm_pw:
+                st.error("Passwords do not match.")
+            elif not new_email or not new_pw or not new_user:
+                st.error("All fields are required.")
             else:
-                db.query("INSERT INTO USERS (email, username, password_hash, role) VALUES (?, ?, ?, ?)",
-                         (new_email, new_user, hash_password(new_pw), 'customer'), commit=True)
-                st.success("Account created! Please login.")
-                st.session_state['page'] = 'login'
-                st.rerun()
+                existing = db.query("SELECT * FROM USERS WHERE email=?", (new_email,))
+                if existing:
+                    st.error("User already exists.")
+                else:
+                    db.query("INSERT INTO USERS (email, username, password_hash, role) VALUES (?, ?, ?, ?)", 
+                             (new_email, new_user, hash_password(new_pw), 'customer'), commit=True)
+                    st.success("Account created! Please log in.")
+                    st.session_state['page'] = 'login'
+                    st.rerun()
     if st.button("Back to Login"):
         st.session_state['page'] = 'login'
         st.rerun()
@@ -206,6 +209,7 @@ def login_page():
     st.title("Login")
     email = st.text_input("Email")
     pw = st.text_input("Password", type="password")
+    
     col1, col2 = st.columns([1, 4])
     with col1:
         if st.button("Login"):
@@ -240,7 +244,7 @@ if st.session_state['logged_in']:
     elif page == 'checkout': checkout_page()
     else: shop_page()
 else:
-    if st.session_state['page'] == 'signup':
+    if st.session_state.get('page') == 'signup':
         signup_page()
     else:
         login_page()
