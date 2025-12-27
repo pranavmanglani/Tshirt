@@ -108,12 +108,22 @@ def dashboard_page():
 
 def shop_page():
     st.title("The Shop")
-    prods = db.query("SELECT * FROM PRODUCTS")
+    
+    # Filter Option
+    categories = ["All"] + [r['category'] for r in db.query("SELECT DISTINCT category FROM PRODUCTS")]
+    selected_cat = st.selectbox("Filter by Category", categories)
+    
+    if selected_cat == "All":
+        prods = db.query("SELECT * FROM PRODUCTS")
+    else:
+        prods = db.query("SELECT * FROM PRODUCTS WHERE category=?", (selected_cat,))
+
     cols = st.columns(3)
     for i, p in enumerate(prods):
         with cols[i % 3]:
             st.image(p['image_url'])
             st.subheader(p['name'])
+            st.write(f"*{p['category']}*")
             if st.button(f"View details - ${p['price']}", key=p['product_id']):
                 st.session_state['selected_product_id'] = p['product_id']
                 st.session_state['page'] = 'product_detail'
@@ -125,32 +135,89 @@ def product_detail_page():
     if not res:
         st.error("Product not found"); st.session_state['page'] = 'shop'; return
     p = res[0]
-    st.title(p['name'])
-    st.image(p['image_url'], width=300)
-    if st.button("Add to Cart"):
-        st.session_state['cart'].append({'id': p['product_id'], 'name': p['name'], 'price': p['price'], 'total': p['price']})
-        st.success("Added to cart!")
+    
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.image(p['image_url'], use_container_width=True)
+    with col2:
+        st.title(p['name'])
+        st.write(f"**Category:** {p['category']}")
+        st.write(p['description'])
+        st.subheader(f"${p['price']}")
+        
+        # Product Details Input
+        size = st.selectbox("Select Size", ["S", "M", "L", "XL", "XXL"])
+        qty = st.number_input("Quantity", min_value=1, max_value=p['stock'], value=1)
+        
+        if st.button("Add to Cart"):
+            st.session_state['cart'].append({
+                'id': p['product_id'], 
+                'name': p['name'], 
+                'price': p['price'], 
+                'size': size, 
+                'qty': qty,
+                'total': p['price'] * qty
+            })
+            st.success(f"Added {qty} {p['name']} (Size: {size}) to cart!")
 
 def checkout_page():
     st.title("Checkout")
     if not st.session_state['cart']:
         st.warning("Empty cart"); return
-    st.table(st.session_state['cart'])
+    
+    df_cart = pd.DataFrame(st.session_state['cart'])
+    st.table(df_cart[['name', 'size', 'qty', 'price', 'total']])
+    
+    grand_total = df_cart['total'].sum()
+    st.write(f"### Grand Total: ${grand_total:.2f}")
+
     if st.button("Place Order", type="primary"):
         st.balloons()
         st.session_state['cart'] = []
         st.success("Order Complete!")
 
+def signup_page():
+    st.title("Create Account")
+    new_email = st.text_input("Email (as Username)")
+    new_user = st.text_input("Full Name")
+    new_pw = st.text_input("Password", type="password")
+    confirm_pw = st.text_input("Confirm Password", type="password")
+    
+    if st.button("Register"):
+        if new_pw != confirm_pw:
+            st.error("Passwords do not match")
+        elif not new_email or not new_pw:
+            st.error("Please fill all fields")
+        else:
+            existing = db.query("SELECT * FROM USERS WHERE email=?", (new_email,))
+            if existing:
+                st.error("User already exists")
+            else:
+                db.query("INSERT INTO USERS (email, username, password_hash, role) VALUES (?, ?, ?, ?)",
+                         (new_email, new_user, hash_password(new_pw), 'customer'), commit=True)
+                st.success("Account created! Please login.")
+                st.session_state['page'] = 'login'
+                st.rerun()
+    if st.button("Back to Login"):
+        st.session_state['page'] = 'login'
+        st.rerun()
+
 def login_page():
     st.title("Login")
     email = st.text_input("Email")
     pw = st.text_input("Password", type="password")
-    if st.button("Login"):
-        res = db.query("SELECT * FROM USERS WHERE email=?", (email,))
-        if res and res[0]['password_hash'] == hash_password(pw):
-            st.session_state.update({'logged_in': True, 'user_details': dict(res[0]), 'page': 'shop'})
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("Login"):
+            res = db.query("SELECT * FROM USERS WHERE email=?", (email,))
+            if res and res[0]['password_hash'] == hash_password(pw):
+                st.session_state.update({'logged_in': True, 'user_details': dict(res[0]), 'page': 'shop'})
+                st.rerun()
+            else: st.error("Wrong credentials")
+    with col2:
+        if st.button("Sign Up"):
+            st.session_state['page'] = 'signup'
             st.rerun()
-        else: st.error("Wrong credentials")
 
 # --- ROUTING ---
 if 'logged_in' not in st.session_state:
@@ -173,4 +240,7 @@ if st.session_state['logged_in']:
     elif page == 'checkout': checkout_page()
     else: shop_page()
 else:
-    login_page()
+    if st.session_state['page'] == 'signup':
+        signup_page()
+    else:
+        login_page()
