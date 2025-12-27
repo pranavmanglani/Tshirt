@@ -16,7 +16,7 @@ DB_NAME = 'tshirt_shop_premium.db'
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-# --- DATABASE INITIALIZATION (WITH FULL ANALYTICS DATA) ---
+# --- DATABASE INITIALIZATION ---
 def initialize_database(target_db_path):
     if os.path.exists(target_db_path):
         os.remove(target_db_path)
@@ -32,17 +32,12 @@ def initialize_database(target_db_path):
             CREATE TABLE DISCOUNTS (code TEXT PRIMARY KEY, discount_type TEXT, value REAL, is_active INTEGER);
             CREATE TABLE DEFECTS (defect_id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, defect_date TEXT, quantity INTEGER, reason TEXT);
         ''')
-        # Admin & Users
         c.execute("INSERT INTO USERS VALUES (?, ?, ?, ?, ?, ?)", ('admin@shop.com', 'Admin User', hash_password('admin'), 'admin', 'https://placehold.co/100', '1990-01-01'))
-        c.execute("INSERT INTO USERS VALUES (?, ?, ?, ?, ?, ?)", ('customer1@email.com', 'Customer One', hash_password('customer1'), 'customer', 'https://placehold.co/100', '1995-05-15'))
-        # Products
         c.execute("INSERT INTO PRODUCTS (name, description, category, price, cost, stock, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)", 
                   ('Vintage Coding Tee', 'Cotton t-shirt.', 'T-Shirt', 25.00, 10.00, 95, 'https://placehold.co/400x400/36454F/FFFFFF?text=Code+Tee'))
         c.execute("INSERT INTO PRODUCTS (name, description, category, price, cost, stock, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)", 
                   ('Python Logo Hoodie', 'Warm hoodie.', 'Hoodie', 55.00, 25.00, 48, 'https://placehold.co/400x400/FFD700/000000?text=Python+Hoodie'))
-        # Sample Defects for Charts
         c.execute("INSERT INTO DEFECTS (product_id, defect_date, quantity, reason) VALUES (1, '2023-10-01', 5, 'Printing Error')")
-        c.execute("INSERT INTO DEFECTS (product_id, defect_date, quantity, reason) VALUES (2, '2023-10-02', 2, 'Stitching Issue')")
 
 class DBManager:
     def __init__(self, db_path):
@@ -68,13 +63,12 @@ def get_db():
 
 db = get_db()
 
-# --- ADMIN DASHBOARD TABS ---
-
+# --- ADMIN FUNCTIONS ---
 def admin_analytics():
     st.subheader("📊 Sales & Financials")
     df = db.query_df("SELECT * FROM ORDERS")
     if df.empty:
-        st.info("No sales data."); return
+        st.info("No sales data yet."); return
     c1, c2, c3 = st.columns(3)
     c1.metric("Revenue", f"${df['total_amount'].sum():.2f}")
     c2.metric("Profit", f"${df['total_profit'].sum():.2f}")
@@ -93,10 +87,8 @@ def admin_defects():
 def dashboard_page():
     st.title("🛡️ Admin Command Center")
     user = st.session_state['user_details']
-    
     if user['role'] != 'admin':
         st.error("Access Denied"); return
-
     tabs = st.tabs(["Analytics", "Defects & QC", "Inventory Management"])
     with tabs[0]: admin_analytics()
     with tabs[1]: admin_defects()
@@ -104,26 +96,22 @@ def dashboard_page():
         st.subheader("📦 Product Stock")
         st.dataframe(db.query_df("SELECT * FROM PRODUCTS"))
 
-# --- STOREFRONT ---
-
+# --- SHOP & DETAILS ---
 def shop_page():
     st.title("The Shop")
-    
-    # --- NEW: Filter Option ---
+    # Category Filter
     categories = ["All"] + [r['category'] for r in db.query("SELECT DISTINCT category FROM PRODUCTS")]
     selected_cat = st.selectbox("Filter by Category", categories)
     
-    if selected_cat == "All":
-        prods = db.query("SELECT * FROM PRODUCTS")
-    else:
-        prods = db.query("SELECT * FROM PRODUCTS WHERE category=?", (selected_cat,))
+    query_str = "SELECT * FROM PRODUCTS" if selected_cat == "All" else "SELECT * FROM PRODUCTS WHERE category=?"
+    params = () if selected_cat == "All" else (selected_cat,)
+    prods = db.query(query_str, params)
 
     cols = st.columns(3)
     for i, p in enumerate(prods):
         with cols[i % 3]:
             st.image(p['image_url'])
             st.subheader(p['name'])
-            st.write(f"*{p['category']}*")
             if st.button(f"View details - ${p['price']}", key=p['product_id']):
                 st.session_state['selected_product_id'] = p['product_id']
                 st.session_state['page'] = 'product_detail'
@@ -145,68 +133,56 @@ def product_detail_page():
         st.write(p['description'])
         st.subheader(f"${p['price']}")
         
-        # --- NEW: Product Details (Size & Qty) ---
+        # New: Size and Quantity Details
         size = st.selectbox("Select Size", ["S", "M", "L", "XL", "XXL"])
         qty = st.number_input("Quantity", min_value=1, max_value=p['stock'], value=1)
         
         if st.button("Add to Cart"):
             st.session_state['cart'].append({
-                'id': p['product_id'], 
-                'name': p['name'], 
-                'price': p['price'], 
-                'size': size, 
-                'qty': qty,
-                'total': p['price'] * qty
+                'id': p['product_id'], 'name': p['name'], 'price': p['price'], 
+                'size': size, 'qty': qty, 'total': p['price'] * qty
             })
-            st.success(f"Added {qty} {p['name']} to cart!")
+            st.success(f"Added {qty} {p['name']} (Size: {size}) to cart!")
 
 def checkout_page():
     st.title("Checkout")
     if not st.session_state['cart']:
         st.warning("Empty cart"); return
-    
     df_cart = pd.DataFrame(st.session_state['cart'])
     st.table(df_cart[['name', 'size', 'qty', 'price', 'total']])
-    
-    grand_total = df_cart['total'].sum()
-    st.write(f"### Grand Total: ${grand_total:.2f}")
-
     if st.button("Place Order", type="primary"):
         st.balloons()
         st.session_state['cart'] = []
         st.success("Order Complete!")
 
-# --- NEW: Sign Up Page ---
+# --- AUTHENTICATION (SIGN UP & LOGIN) ---
 def signup_page():
-    st.title("Create Account")
+    st.title("🛡️ Create New Account")
     with st.form("signup_form"):
-        new_email = st.text_input("Email")
+        new_email = st.text_input("Email Address")
         new_user = st.text_input("Username")
         new_pw = st.text_input("Password", type="password")
         confirm_pw = st.text_input("Confirm Password", type="password")
-        submit = st.form_submit_button("Sign Up")
-        
-        if submit:
+        if st.form_submit_button("Create Account"):
             if new_pw != confirm_pw:
                 st.error("Passwords do not match.")
             elif not new_email or not new_pw or not new_user:
-                st.error("All fields are required.")
+                st.error("Fill in all fields.")
             else:
                 existing = db.query("SELECT * FROM USERS WHERE email=?", (new_email,))
                 if existing:
-                    st.error("User already exists.")
+                    st.error("Email already registered.")
                 else:
                     db.query("INSERT INTO USERS (email, username, password_hash, role) VALUES (?, ?, ?, ?)", 
                              (new_email, new_user, hash_password(new_pw), 'customer'), commit=True)
-                    st.success("Account created! Please log in.")
+                    st.success("Success! You can now log in.")
                     st.session_state['page'] = 'login'
                     st.rerun()
     if st.button("Back to Login"):
-        st.session_state['page'] = 'login'
-        st.rerun()
+        st.session_state['page'] = 'login'; st.rerun()
 
 def login_page():
-    st.title("Login")
+    st.title("🔐 Shop Login")
     email = st.text_input("Email")
     pw = st.text_input("Password", type="password")
     
@@ -219,18 +195,18 @@ def login_page():
                 st.rerun()
             else: st.error("Wrong credentials")
     with col2:
-        if st.button("Sign Up"):
+        if st.button("Create Account (Sign Up)"):
             st.session_state['page'] = 'signup'
             st.rerun()
 
-# --- ROUTING ---
+# --- MAIN ROUTING ---
 if 'logged_in' not in st.session_state:
     st.session_state.update({'logged_in': False, 'page': 'login', 'cart': []})
 
 if st.session_state['logged_in']:
     user = st.session_state['user_details']
     with st.sidebar:
-        st.write(f"Logged in: {user['username']}")
+        st.write(f"Logged in as: **{user['username']}**")
         if st.button("Shop"): st.session_state['page'] = 'shop'; st.rerun()
         if st.button("Cart/Checkout"): st.session_state['page'] = 'checkout'; st.rerun()
         if user['role'] == 'admin':
@@ -242,6 +218,7 @@ if st.session_state['logged_in']:
     if page == 'dashboard': dashboard_page()
     elif page == 'product_detail': product_detail_page()
     elif page == 'checkout': checkout_page()
+    elif page == 'signup': signup_page() # Allow signup even if logged in logic
     else: shop_page()
 else:
     if st.session_state.get('page') == 'signup':
