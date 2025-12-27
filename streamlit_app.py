@@ -11,21 +11,17 @@ import time
 # Set page configuration
 st.set_page_config(page_title="Code & Thread Shop - Premium", layout="wide", initial_sidebar_state="expanded")
 
-# --- Constants and Configuration ---
 DB_NAME = 'tshirt_shop_premium.db'
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-# --- DATABASE INITIALIZATION ---
 def initialize_database(target_db_path):
     if os.path.exists(target_db_path):
         os.remove(target_db_path)
-             
     conn = sqlite3.connect(target_db_path, check_same_thread=False, timeout=60)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    
     with conn: 
         schema_script = '''
             CREATE TABLE USERS (email TEXT PRIMARY KEY, username TEXT, password_hash TEXT, role TEXT, profile_pic_url TEXT, birthday TEXT);
@@ -36,12 +32,10 @@ def initialize_database(target_db_path):
             CREATE TABLE DEFECTS (defect_id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER, defect_date TEXT, quantity INTEGER, reason TEXT, FOREIGN KEY (product_id) REFERENCES PRODUCTS(product_id));
         '''
         c.executescript(schema_script)
-
-        # Initial Data
         c.execute("INSERT INTO USERS VALUES (?, ?, ?, ?, ?, ?)", ('admin@shop.com', 'admin', hash_password('admin'), 'admin', 'https://placehold.co/100x100/1E88E5/FFFFFF?text=A', '1990-01-01'))
-        
+        c.execute("INSERT INTO USERS VALUES (?, ?, ?, ?, ?, ?)", ('customer1@email.com', 'customer1', hash_password('customer1'), 'customer', 'https://placehold.co/100x100/FBC02D/333333?text=C', '1995-05-15'))
         products_data = [
-            ('Vintage Coding Tee', 'Cotton t-shirt for devs.', 'T-Shirt', 25.00, 10.00, 95, 'https://placehold.co/400x400/36454F/FFFFFF?text=Code+Tee'),
+            ('Vintage Coding Tee', 'Cotton t-shirt.', 'T-Shirt', 25.00, 10.00, 95, 'https://placehold.co/400x400/36454F/FFFFFF?text=Code+Tee'),
             ('Python Logo Hoodie', 'Warm hoodie.', 'Hoodie', 55.00, 25.00, 48, 'https://placehold.co/400x400/FFD700/000000?text=Python+Hoodie')
         ]
         c.executemany("INSERT INTO PRODUCTS (name, description, category, price, cost, stock, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)", products_data)
@@ -54,134 +48,139 @@ class DBManager:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=60)
         self._conn.row_factory = sqlite3.Row
 
-    def query(self, query, params=(), commit=False):
+    def execute_query(self, query, params=(), commit=False):
         with self._lock:
             c = self._conn.cursor()
-            res = c.execute(query, params)
+            c.execute(query, params)
             if commit: self._conn.commit()
-            return res.fetchall()
+            return c
 
-    def query_df(self, query, params=()):
+    def fetch_query(self, query, params=()):
+        with self._lock:
+            c = self._conn.cursor()
+            c.execute(query, params)
+            return c.fetchall()
+
+    def fetch_query_df(self, query, params=()):
         with self._lock:
             return pd.read_sql_query(query, self._conn, params=params)
 
 @st.cache_resource
-def get_db():
+def get_db_manager():
     if not os.path.exists(DB_NAME): initialize_database(DB_NAME)
     return DBManager(DB_NAME)
 
-db = get_db()
+db_manager = get_db_manager()
 
-# --- ORIGINAL ADMIN PAGES ---
+# --- ADMIN FUNCTIONS (RESTORED) ---
 
 def admin_analytics():
-    st.header("📊 Sales & Financial Performance")
-    df_orders = db.query_df("SELECT * FROM ORDERS")
+    st.markdown("### 📊 Sales & Financial Performance")
+    df_orders = db_manager.fetch_query_df("SELECT * FROM ORDERS")
     if df_orders.empty:
-        st.info("No orders yet."); return
-
-    # KPI Metrics
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Revenue", f"${df_orders['total_amount'].sum():,.2f}")
-    c2.metric("Total Profit", f"${df_orders['total_profit'].sum():,.2f}")
-    c3.metric("Order Count", len(df_orders))
-
-    # Line Chart: Revenue Over Time
+        st.info("No orders placed yet."); return
+    total_revenue = df_orders['total_amount'].sum()
+    total_profit = df_orders['total_profit'].sum()
+    col1, col2 = st.columns(2)
+    col1.metric("Total Revenue", f"${total_revenue:,.2f}")
+    col2.metric("Total Profit", f"${total_profit:,.2f}")
     df_orders['date'] = pd.to_datetime(df_orders['order_date']).dt.date
-    daily = df_orders.groupby('date').sum()[['total_amount', 'total_profit']]
-    st.line_chart(daily)
+    st.line_chart(df_orders.groupby('date').sum()[['total_amount', 'total_profit']])
 
-def admin_defects():
-    st.header("⚠️ Quality Control")
-    df_defects = db.query_df("SELECT D.*, P.name FROM DEFECTS D JOIN PRODUCTS P ON D.product_id = P.product_id")
-    if not df_defects.empty:
-        st.bar_chart(df_defects, x="reason", y="quantity")
-        st.dataframe(df_defects)
-    else:
-        st.info("No defect data found.")
+def admin_defects_analysis():
+    st.markdown("### ⚠️ Quality Control & Defect Analysis")
+    df_defects = db_manager.fetch_query_df("SELECT D.*, P.name FROM DEFECTS D JOIN PRODUCTS P ON D.product_id = P.product_id")
+    if df_defects.empty:
+        st.info("No defects recorded."); return
+    st.bar_chart(df_defects.groupby('reason')['quantity'].sum())
+    st.dataframe(df_defects)
+
+def admin_product_management():
+    st.markdown("### 📦 Inventory & Pricing")
+    df_products = db_manager.fetch_query_df("SELECT * FROM PRODUCTS")
+    st.dataframe(df_products)
+
+# --- USER INTERFACE ---
 
 def dashboard_page():
-    st.title("🛡️ Admin Command Center")
-    tabs = st.tabs(["Analytics", "Defects & QC", "Product Management"])
-    with tabs[0]: admin_analytics()
-    with tabs[1]: admin_defects()
-    with tabs[2]: st.write("Product management functions would be here.")
-
-# --- SHOP PAGES ---
+    st.title("User Dashboard")
+    user_details = st.session_state['user_details']
+    tabs_labels = ["📦 Order History", "👤 Profile"]
+    if user_details['role'] == 'admin':
+        tabs_labels.append("⚙️ Admin Panel")
+    
+    tabs = st.tabs(tabs_labels)
+    with tabs[0]: st.write("Order history logic here.")
+    with tabs[1]: st.write("Profile settings logic here.")
+    if user_details['role'] == 'admin':
+        with tabs[2]:
+            admin_tabs = st.tabs(["📊 Sales Analytics", "⚠️ Defects Analysis", "📦 Inventory & Pricing"])
+            with admin_tabs[0]: admin_analytics()
+            with admin_tabs[1]: admin_defects_analysis()
+            with admin_tabs[2]: admin_product_management()
 
 def shop_page():
     st.title("The Shop")
-    df = db.query_df("SELECT * FROM PRODUCTS WHERE stock > 0")
-    cols = st.columns(3)
+    df = db_manager.fetch_query_df("SELECT * FROM PRODUCTS WHERE stock > 0")
+    cols = st.columns(4)
     for i, row in df.iterrows():
-        with cols[i % 3]:
+        with cols[i % 4]:
             st.image(row['image_url'])
-            st.subheader(row['name'])
-            if st.button(f"View Details ${row['price']}", key=row['product_id']):
+            st.write(f"**{row['name']}**")
+            if st.button("View Details", key=f"btn_{row['product_id']}"):
                 st.session_state['selected_product_id'] = row['product_id']
                 st.session_state['page'] = 'product_detail'
                 st.rerun()
 
 def product_detail_page():
     pid = st.session_state.get('selected_product_id')
-    res = db.query("SELECT * FROM PRODUCTS WHERE product_id=?", (pid,)) if pid else None
+    res = db_manager.fetch_query("SELECT * FROM PRODUCTS WHERE product_id = ?", (pid,)) if pid else None
     if not res:
-        st.error("Product Not Found"); st.session_state['page'] = 'shop'; return
-    
-    p = res[0]
+        st.session_state['page'] = 'shop'; st.rerun()
+    p = dict(res[0])
     st.title(p['name'])
     st.image(p['image_url'], width=300)
-    if st.button("Add to Cart"):
-        st.session_state['cart'].append({'id': p['product_id'], 'name': p['name'], 'price': p['price'], 'total': p['price']})
-        st.toast("Added!")
+    if st.button("➕ Add to Cart"):
+        st.session_state['cart'].append({'product_id': p['product_id'], 'name': p['name'], 'price': p['price'], 'total': p['price'], 'quantity': 1, 'size': 'M'})
         st.session_state['page'] = 'checkout'
         st.rerun()
 
 def checkout_page():
     st.title("Checkout")
-    if not st.session_state['cart']:
-        st.warning("Empty cart"); 
-        if st.button("Back"): st.session_state['page'] = 'shop'; st.rerun()
-        return
-    
+    if not st.session_state.get('cart'):
+        st.warning("Empty cart"); return
     st.table(st.session_state['cart'])
-    if st.button("Complete Purchase"):
-        st.success("Order Placed Successfully!")
-        st.session_state['cart'] = []
-        time.sleep(1)
-        st.session_state['page'] = 'shop'
-        st.rerun()
+    if st.button("Pay Now"):
+        st.success("Success!"); st.session_state['cart'] = []; st.rerun()
 
 def login_page():
     st.title("Login")
-    with st.form("l"):
-        email = st.text_input("Email")
-        pw = st.text_input("Password", type="password")
-        if st.form_submit_button("Login"):
-            res = db.query("SELECT * FROM USERS WHERE email=?", (email,))
-            if res and res[0]['password_hash'] == hash_password(pw):
-                st.session_state.update({'logged_in': True, 'user': dict(res[0]), 'page': 'shop'})
-                st.rerun()
-            else: st.error("Invalid")
+    email = st.text_input("Email")
+    pw = st.text_input("Password", type="password")
+    if st.button("Login"):
+        res = db_manager.fetch_query("SELECT * FROM USERS WHERE email = ?", (email,))
+        if res and res[0]['password_hash'] == hash_password(pw):
+            st.session_state.update({'logged_in': True, 'email': email, 'username': res[0]['username'], 'user_details': dict(res[0]), 'page': 'shop'})
+            st.rerun()
+        else: st.error("Invalid credentials")
 
-# --- MAIN LOGIC ---
-if 'logged_in' not in st.session_state:
-    st.session_state.update({'logged_in': False, 'page': 'login', 'cart': []})
+def main():
+    if 'logged_in' not in st.session_state:
+        st.session_state.update({'logged_in': False, 'page': 'login', 'cart': []})
+    
+    if st.session_state['logged_in']:
+        with st.sidebar:
+            if st.button("🛒 Shop"): st.session_state['page'] = 'shop'; st.rerun()
+            if st.button("👤 Dashboard"): st.session_state['page'] = 'dashboard'; st.rerun()
+            if st.button("Logout"): st.session_state.clear(); st.rerun()
+        
+        pg = st.session_state.get('page', 'shop')
+        if pg == 'shop': shop_page()
+        elif pg == 'product_detail': product_detail_page()
+        elif pg == 'checkout': checkout_page()
+        elif pg == 'dashboard': dashboard_page()
+    else:
+        login_page()
 
-if st.session_state['logged_in']:
-    u = st.session_state['user']
-    with st.sidebar:
-        st.write(f"User: {u['username']} ({u['role']})")
-        if st.button("Shop"): st.session_state['page'] = 'shop'; st.rerun()
-        if st.button("Checkout"): st.session_state['page'] = 'checkout'; st.rerun()
-        if u['role'] == 'admin' and st.button("🛡️ Admin Dashboard"):
-            st.session_state['page'] = 'dashboard'; st.rerun()
-        if st.button("Logout"): st.session_state.clear(); st.rerun()
-
-    p = st.session_state['page']
-    if p == 'dashboard': dashboard_page()
-    elif p == 'product_detail': product_detail_page()
-    elif p == 'checkout': checkout_page()
-    else: shop_page()
-else:
-    login_page()
+if __name__ == '__main__':
+    main()
